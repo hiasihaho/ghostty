@@ -527,7 +527,9 @@ pub fn add(
     }
 
     // If we're building an exe then we have additional dependencies.
-    if (step.kind != .lib) {
+    // A lib with app_runtime=gtk (the Linux GTK embedding shim) needs the
+    // same GTK/glad dependency set as the exe.
+    if (step.kind != .lib or self.config.app_runtime == .gtk) {
         // We always statically compile glad
         step.addIncludePath(b.path("vendor/glad/include/"));
         step.addCSourceFile(.{

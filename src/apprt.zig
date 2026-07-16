@@ -44,7 +44,14 @@ pub const runtime = switch (build_config.artifact) {
         .none => none,
         .gtk => gtk,
     },
-    .lib => embedded,
+    // A library is normally the macOS/iOS embedding API (apprt=embedded).
+    // With -Dapp-runtime=gtk a library embeds the GTK apprt instead — the
+    // Linux embedding shim (src/lib_gtk_embed.zig) exports GhosttySurface
+    // widgets to a foreign GTK4 host app.
+    .lib => switch (build_config.app_runtime) {
+        .none => embedded,
+        .gtk => gtk,
+    },
     .wasm_module => browser,
 };
 

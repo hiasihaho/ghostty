@@ -216,6 +216,28 @@ pub const Application = extern struct {
         pub var offset: c_int = 0;
     };
 
+    /// Set when this Application is embedded in a foreign GTK host app
+    /// via the Linux embedding shim (src/lib_gtk_embed.zig). In that mode
+    /// the process-default GApplication belongs to the host, so
+    /// `default()` resolves through this global instead, and `wakeup()`
+    /// schedules a coalesced idle tick because `run()` (the normal tick
+    /// driver) never executes.
+    var embed_instance: ?*Self = null;
+    var embed_mode: bool = false;
+    var embed_tick_pending: std.atomic.Value(bool) = .init(false);
+
+    /// Called by the embedding shim BEFORE `new()`: the host has already
+    /// initialized GTK, so pre-init work (setGtkEnv) must be skipped.
+    pub fn setEmbedMode() void {
+        embed_mode = true;
+    }
+
+    /// Mark this instance as the embedded singleton. Only the embedding
+    /// shim calls this; standalone Ghostty never does.
+    pub fn setEmbedInstance(self: *Self) void {
+        embed_instance = self;
+    }
+
     /// Get this application as the default, allowing access to its
     /// properties globally.
     ///
@@ -223,6 +245,7 @@ pub const Application = extern struct {
     /// default application is a GhosttyApplication. The program would have
     /// to be in a very bad state for this to be violated.
     pub fn default() *Self {
+        if (embed_instance) |instance| return instance;
         const app = gio.Application.getDefault().?;
         return gobject.ext.cast(Self, app).?;
     }
@@ -287,8 +310,10 @@ pub const Application = extern struct {
             log.warn("i18n initialization failed error={}", .{err});
         };
 
-        // Setup our GTK init env vars
-        setGtkEnv(&config) catch |err| switch (err) {
+        // Setup our GTK init env vars. In embed mode the host app has
+        // already initialized GTK (setGtkEnv asserts the opposite) and
+        // the host's environment is authoritative — skip.
+        if (!embed_mode) setGtkEnv(&config) catch |err| switch (err) {
             error.NoSpaceLeft => {
                 // If we fail to set GTK environment variables then we still
                 // try to start the application...
@@ -1268,7 +1293,31 @@ pub const Application = extern struct {
 
     pub fn wakeup(self: *Self) void {
         _ = self;
+
+        // Embedded in a foreign main loop: nothing calls tick for us
+        // (run() never executes), so schedule one. Coalesce because
+        // wakeup can fire from the renderer/IO threads in bursts;
+        // glib.idleAdd is thread-safe.
+        if (embed_instance != null) {
+            if (!embed_tick_pending.swap(true, .acq_rel)) {
+                _ = glib.idleAdd(embedTick, null);
+            }
+            return;
+        }
+
         glib.MainContext.wakeup(null);
+    }
+
+    /// Idle callback driving core_app.tick in embed mode — the loop body
+    /// of run() minus the quit logic (the host owns process lifetime).
+    fn embedTick(_: ?*anyopaque) callconv(.c) c_int {
+        embed_tick_pending.store(false, .release);
+        const self = embed_instance orelse return 0;
+        const priv = self.private();
+        priv.core_app.tick(priv.rt_app) catch |err| {
+            log.warn("embed tick error={}", .{err});
+        };
+        return 0; // G_SOURCE_REMOVE
     }
 
     //---------------------------------------------------------------

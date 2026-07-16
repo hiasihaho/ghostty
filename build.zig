@@ -145,6 +145,21 @@ pub fn build(b: *std.Build) !void {
         }
     }
 
+    // Linux GTK embedding shim (see src/lib_gtk_embed.zig): a shared
+    // library exposing GhosttySurface widgets to a foreign GTK4 host.
+    // Only meaningful with the GTK apprt; built via `zig build lib-gtk`.
+    if (config.app_runtime == .gtk and !config.target.result.os.tag.isDarwin()) {
+        const libghostty_gtk = try buildpkg.GhosttyLib.initSharedGtk(b, &deps);
+        const lib_gtk_step = b.step("lib-gtk", "Build the Linux GTK embedding shim library");
+        const lib_install = b.addInstallLibFile(libghostty_gtk.output, "libghostty-gtk.so");
+        const header_install = b.addInstallHeaderFile(
+            b.path("include/ghostty_gtk_embed.h"),
+            "ghostty_gtk_embed.h",
+        );
+        lib_gtk_step.dependOn(&lib_install.step);
+        lib_gtk_step.dependOn(&header_install.step);
+    }
+
     // macOS only artifacts. These will error if they're initialized for
     // other targets.
     if (config.target.result.os.tag.isDarwin()) {

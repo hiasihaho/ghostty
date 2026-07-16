@@ -109,6 +109,37 @@ pub fn initShared(
     };
 }
 
+/// The Linux GTK embedding shim: a shared library rooted at
+/// src/lib_gtk_embed.zig that bundles the GTK apprt (deps must be
+/// configured with app_runtime == .gtk so SharedDeps links GTK/glad and
+/// the gresources).
+pub fn initSharedGtk(
+    b: *std.Build,
+    deps: *const SharedDeps,
+) !GhosttyLib {
+    const lib = b.addLibrary(.{
+        .name = "ghostty-gtk",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib_gtk_embed.zig"),
+            .target = deps.config.target,
+            .optimize = deps.config.optimize,
+            .strip = deps.config.strip,
+            .omit_frame_pointer = deps.config.strip,
+            .unwind_tables = if (deps.config.strip) .none else .sync,
+        }),
+        .use_llvm = true,
+    });
+    lib.linkLibC();
+    _ = try deps.add(lib);
+
+    return .{
+        .step = &lib.step,
+        .output = lib.getEmittedBin(),
+        .dsym = null,
+    };
+}
+
 pub fn initMacOSUniversal(
     b: *std.Build,
     original_deps: *const SharedDeps,
