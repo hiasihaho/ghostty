@@ -40,6 +40,14 @@ void* ghostty_embed_surface_new(const char* working_directory,
                                 const char** env_values,
                                 size_t env_len);
 
+// Wrap a surface widget in Ghostty's own scrolled-window container
+// (config-bound scrollbar visibility, horizontal scrolling disabled).
+// Use this as the pane child: a plain GtkScrolledWindow with automatic
+// policies lets the surface keep its natural size instead of tracking
+// the host window. Returns a floating GtkWidget*, or NULL if the
+// argument is not a GhosttySurface.
+void* ghostty_embed_surface_container_new(void* surface_widget);
+
 // Write bytes RAW to the surface's PTY (no paste encoding) — send_text /
 // send_key semantics, like vte_terminal_feed_child. Returns false while
 // the surface's shell isn't running yet (unrealized background pane).

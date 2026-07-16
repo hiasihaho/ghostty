@@ -29,6 +29,7 @@ const ApprtApp = @import("apprt/gtk/App.zig");
 const Application = @import("apprt/gtk/class/application.zig").Application;
 const Config = @import("apprt/gtk/class/config.zig").Config;
 const Surface = @import("apprt/gtk/class/surface.zig").Surface;
+const SurfaceScrolledWindow = @import("apprt/gtk/class/surface_scrolled_window.zig").SurfaceScrolledWindow;
 
 const log = std.log.scoped(.gtk_embed);
 
@@ -253,4 +254,23 @@ export fn ghostty_embed_surface_read_text(
 /// Free a string returned by ghostty_embed_surface_read_text.
 export fn ghostty_embed_text_free(ptr: ?[*:0]u8) void {
     if (ptr) |p| state.alloc.free(std.mem.span(p));
+}
+
+/// Wrap a surface widget in Ghostty's own scrolled-window container
+/// (config-bound scrollbar visibility, hscrollbar never). Hosts should
+/// use this as the pane child: a plain GtkScrolledWindow with automatic
+/// policies lets the scrollable surface keep its natural size instead of
+/// tracking the host window, so panes never resize with the window.
+/// Returns a floating GtkWidget*, or NULL if `surface_widget` is not a
+/// GhosttySurface.
+export fn ghostty_embed_surface_container_new(
+    surface_widget: *gtk.Widget,
+) ?*gtk.Widget {
+    const surface = gobject.ext.cast(
+        Surface,
+        surface_widget.as(gobject.Object),
+    ) orelse return null;
+    const scrolled = gobject.ext.newInstance(SurfaceScrolledWindow, .{});
+    scrolled.setSurface(surface);
+    return scrolled.as(gtk.Widget);
 }
