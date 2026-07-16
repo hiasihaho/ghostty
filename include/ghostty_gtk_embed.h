@@ -25,8 +25,17 @@ extern "C" {
 int ghostty_embed_init(void);
 
 // Create a terminal surface widget. Returns a GtkWidget* with a floating
-// reference, or NULL if the shim is not initialized.
-void* ghostty_embed_surface_new(void);
+// reference, or NULL if the shim is not initialized or configuration
+// cloning fails.
+//
+// working_directory: shell start directory, or NULL for the config/user
+// default. env_keys/env_values: parallel arrays of env_len extra
+// environment variables for the spawned shell (NULL allowed when
+// env_len is 0). Both apply via a per-surface clone of the user config.
+void* ghostty_embed_surface_new(const char* working_directory,
+                                const char** env_keys,
+                                const char** env_values,
+                                size_t env_len);
 
 #ifdef __cplusplus
 }

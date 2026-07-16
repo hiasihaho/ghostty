@@ -24,6 +24,7 @@ const state = &@import("global.zig").state;
 const CoreApp = @import("App.zig");
 const ApprtApp = @import("apprt/gtk/App.zig");
 const Application = @import("apprt/gtk/class/application.zig").Application;
+const Config = @import("apprt/gtk/class/config.zig").Config;
 const Surface = @import("apprt/gtk/class/surface.zig").Surface;
 
 const log = std.log.scoped(.gtk_embed);
@@ -97,12 +98,78 @@ export fn ghostty_embed_init() c_int {
 /// (shell spawn, renderer + IO threads) initializes lazily when the
 /// widget's GLArea is first realized and sized.
 ///
-/// Returns NULL if the shim is not initialized.
-export fn ghostty_embed_surface_new() ?*gtk.Widget {
+/// `working_directory` (nullable) and `env` (parallel key/value arrays,
+/// nullable when `env_len` is 0) apply to the spawned shell via a
+/// per-surface clone of the user's config (`working-directory` + `env`
+/// config keys), leaving the app-level config untouched.
+///
+/// Returns NULL if the shim is not initialized or the config clone fails.
+export fn ghostty_embed_surface_new(
+    working_directory: ?[*:0]const u8,
+    env_keys: ?[*]const [*:0]const u8,
+    env_values: ?[*]const [*:0]const u8,
+    env_len: usize,
+) ?*gtk.Widget {
     if (embed_state.core_app == null) {
         log.err("ghostty_embed_surface_new before ghostty_embed_init", .{});
         return null;
     }
+
     const surface = Surface.new();
+
+    if (working_directory != null or env_len > 0) {
+        applySurfaceOverrides(
+            surface,
+            working_directory,
+            env_keys,
+            env_values,
+            env_len,
+        ) catch |err| {
+            log.err("per-surface config overrides failed error={}", .{err});
+            surface.as(gobject.Object).unref();
+            return null;
+        };
+    }
+
     return surface.as(gtk.Widget);
+}
+
+/// Clone the app config, apply per-surface working-directory/env
+/// overrides, and hand the clone to the surface. Must run before the
+/// widget is realized (the core surface reads the config at realize).
+fn applySurfaceOverrides(
+    surface: *Surface,
+    working_directory: ?[*:0]const u8,
+    env_keys: ?[*]const [*:0]const u8,
+    env_values: ?[*]const [*:0]const u8,
+    env_len: usize,
+) !void {
+    const app = Application.default();
+    const app_config = app.getConfig();
+    defer app_config.unref();
+
+    // Config.new clones the core config (own arena); mutate the clone.
+    const surface_config = try Config.new(state.alloc, app_config.get());
+    defer surface_config.unref();
+
+    const core = surface_config.getMut();
+    const arena = core._arena.?.allocator();
+
+    if (working_directory) |wd| {
+        core.@"working-directory" = try arena.dupe(u8, std.mem.span(wd));
+    }
+
+    if (env_len > 0) {
+        const keys = env_keys orelse return error.InvalidEnv;
+        const values = env_values orelse return error.InvalidEnv;
+        for (0..env_len) |i| {
+            const entry = try std.fmt.allocPrint(arena, "{s}={s}", .{
+                std.mem.span(keys[i]),
+                std.mem.span(values[i]),
+            });
+            try core.env.parseCLI(arena, entry);
+        }
+    }
+
+    surface.setConfig(surface_config);
 }
