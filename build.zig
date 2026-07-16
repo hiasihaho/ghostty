@@ -158,6 +158,9 @@ pub fn build(b: *std.Build) !void {
         );
         lib_gtk_step.dependOn(&lib_install.step);
         lib_gtk_step.dependOn(&header_install.step);
+        // Shell integration / terminfo / themes for embedded surfaces:
+        // hosts point GHOSTTY_RESOURCES_DIR at <prefix>/share/ghostty.
+        resources.addStepDependencies(lib_gtk_step);
     }
 
     // macOS only artifacts. These will error if they're initialized for

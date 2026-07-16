@@ -834,7 +834,10 @@ inline fn surfaceMailbox(self: *Surface) Mailbox {
 ///
 /// We centralize all our logic into this spot so we can intercept
 /// messages for example in readonly mode.
-fn queueIo(
+///
+/// Pub so the GTK embedding shim (lib_gtk_embed.zig) can inject raw
+/// PTY writes with the readonly guard intact.
+pub fn queueIo(
     self: *Surface,
     msg: termio.Message,
     mutex: termio.Termio.MutexState,

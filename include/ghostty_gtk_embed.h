@@ -16,6 +16,9 @@
 #ifndef GHOSTTY_GTK_EMBED_H
 #define GHOSTTY_GTK_EMBED_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,6 +39,20 @@ void* ghostty_embed_surface_new(const char* working_directory,
                                 const char** env_keys,
                                 const char** env_values,
                                 size_t env_len);
+
+// Write bytes RAW to the surface's PTY (no paste encoding) — send_text /
+// send_key semantics, like vte_terminal_feed_child. Returns false while
+// the surface's shell isn't running yet (unrealized background pane).
+bool ghostty_embed_surface_send_text(void* widget,
+                                     const unsigned char* bytes,
+                                     size_t len);
+
+// Read terminal text: the active screenful (ending at the cursor), or the
+// whole buffer including scrollback history. Returns a NUL-terminated
+// string to release with ghostty_embed_text_free, or NULL while the
+// surface's shell isn't running yet.
+char* ghostty_embed_surface_read_text(void* widget, bool include_scrollback);
+void ghostty_embed_text_free(char* text);
 
 #ifdef __cplusplus
 }

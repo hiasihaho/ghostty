@@ -61,6 +61,17 @@ pub fn postFork(cmd: *Command) Command.PostForkError!void {
 
     const app = Application.default();
 
+    // An unregistered application (e.g. embedded via lib_gtk_embed) has no
+    // dbus connection and g_application_get_dbus_connection logs a GLib
+    // CRITICAL when asked — skip the transient-scope transition quietly.
+    if (app.as(gio.Application).getIsRegistered() == 0) {
+        if (cmd.rt_post_fork_info.linux_cgroup_hard_fail) {
+            log.err("dbus connection required for cgroup isolation, exiting", .{});
+            return error.PostForkError;
+        }
+        return;
+    }
+
     const dbus = app.as(gio.Application).getDbusConnection() orelse {
         if (cmd.rt_post_fork_info.linux_cgroup_hard_fail) {
             log.err("dbus connection required for cgroup isolation, exiting", .{});

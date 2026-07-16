@@ -21,7 +21,10 @@ const gtk = @import("gtk");
 const apprt = @import("apprt.zig");
 const main = @import("main_ghostty.zig");
 const state = &@import("global.zig").state;
+const terminal = @import("terminal/main.zig");
+const termio = @import("termio.zig");
 const CoreApp = @import("App.zig");
+const CoreSurface = @import("Surface.zig");
 const ApprtApp = @import("apprt/gtk/App.zig");
 const Application = @import("apprt/gtk/class/application.zig").Application;
 const Config = @import("apprt/gtk/class/config.zig").Config;
@@ -172,4 +175,82 @@ fn applySurfaceOverrides(
     }
 
     surface.setConfig(surface_config);
+}
+
+/// Widget → GhosttySurface → core surface. Null until the GLArea has
+/// realized and the core surface exists (e.g. panes in never-shown
+/// background workspaces).
+fn coreSurfaceFromWidget(widget: *gtk.Widget) ?*CoreSurface {
+    const surface = gobject.ext.cast(
+        Surface,
+        widget.as(gobject.Object),
+    ) orelse return null;
+    return surface.core();
+}
+
+/// Write bytes RAW to the surface's PTY (no paste encoding) — the
+/// semantics of the host's send_text/send_key verbs, matching a
+/// vte_terminal_feed_child. Returns false when the core surface isn't
+/// initialized yet (unrealized background pane) or the widget is not a
+/// GhosttySurface.
+export fn ghostty_embed_surface_send_text(
+    widget: *gtk.Widget,
+    ptr: [*]const u8,
+    len: usize,
+) bool {
+    const core_surface = coreSurfaceFromWidget(widget) orelse return false;
+    if (len == 0) return true;
+    const msg = termio.Message.writeReq(
+        state.alloc,
+        ptr[0..len],
+    ) catch return false;
+    core_surface.queueIo(msg, .unlocked);
+    return true;
+}
+
+/// Read terminal text: the active screen area ("screenful ending at the
+/// cursor", matching the host's VTE read_text) or, with
+/// `include_scrollback`, the whole screen buffer including history.
+/// Returns a NUL-terminated string owned by the shim — free it with
+/// ghostty_embed_text_free — or NULL if the core surface isn't ready.
+export fn ghostty_embed_surface_read_text(
+    widget: *gtk.Widget,
+    include_scrollback: bool,
+) ?[*:0]u8 {
+    const core_surface = coreSurfaceFromWidget(widget) orelse return null;
+
+    core_surface.renderer_state.mutex.lock();
+    defer core_surface.renderer_state.mutex.unlock();
+
+    const screen = core_surface.renderer_state.terminal.screens.active;
+    const pages = &screen.pages;
+    const tl = if (include_scrollback)
+        pages.pin(.{ .screen = .{ .x = 0, .y = 0 } })
+    else
+        pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
+    const br = pages.pin(.{ .active = .{
+        .x = pages.cols -| 1,
+        .y = pages.rows -| 1,
+    } });
+    const sel: terminal.Selection = .{
+        .bounds = .{ .untracked = .{
+            .start = tl orelse return null,
+            .end = br orelse return null,
+        } },
+        .rectangle = false,
+    };
+
+    var text = core_surface.dumpTextLocked(state.alloc, sel) catch |err| {
+        log.warn("read_text failed error={}", .{err});
+        return null;
+    };
+    defer text.deinit(state.alloc);
+
+    const out = state.alloc.dupeZ(u8, text.text) catch return null;
+    return out.ptr;
+}
+
+/// Free a string returned by ghostty_embed_surface_read_text.
+export fn ghostty_embed_text_free(ptr: ?[*:0]u8) void {
+    if (ptr) |p| state.alloc.free(std.mem.span(p));
 }
