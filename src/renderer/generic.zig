@@ -1459,32 +1459,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // thread delivers the new terminal state/cell buffers, we can show a single-frame
             // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
             // last completed frame and let the normal render loop catch up on the next tick.
-            if (sync and size_changed and self.has_presented.load(.monotonic)) {
-                try self.api.presentLastTarget();
-                return;
-            }
-
-            // During resize/layout transitions, the platform can trigger draws before the IO
-            // thread has delivered the corresponding terminal resize (and thus before updateFrame
-            // has rebuilt GPU cell buffers for the new grid). If we draw in that window we can
-            // render nothing but background (visually blank) because the projection/padding math
-            // uses a stale `cells.size` that doesn't match the new screen size.
             //
-            // Detect this by computing the expected grid for the current surface size and
-            // comparing it to the currently rebuilt cell buffer grid. If they don't match, keep
-            // the last presented frame on-screen until the new cells arrive.
-            if (size_changed) {
-                const expected_grid = (renderer.Size{
-                    .screen = .{ .width = surface_size.width, .height = surface_size.height },
-                    .cell = self.size.cell,
-                    .padding = self.size.padding,
-                }).grid();
-
-                if (expected_grid.columns != self.cells.size.columns or
-                    expected_grid.rows != self.cells.size.rows)
-                {
+            // Darwin-only: this relies on the display link delivering ASYNC draws that
+            // eventually break the stale-frame replay. On GTK every draw is synchronous
+            // (drawFrame(true) from the render callback), so these early returns latch
+            // permanently after a resize and the surface freezes on its last frame.
+            if (comptime builtin.target.os.tag.isDarwin()) {
+                if (sync and size_changed and self.has_presented.load(.monotonic)) {
                     try self.api.presentLastTarget();
                     return;
+                }
+
+                // During resize/layout transitions, the platform can trigger draws before the IO
+                // thread has delivered the corresponding terminal resize (and thus before updateFrame
+                // has rebuilt GPU cell buffers for the new grid). If we draw in that window we can
+                // render nothing but background (visually blank) because the projection/padding math
+                // uses a stale `cells.size` that doesn't match the new screen size.
+                //
+                // Detect this by computing the expected grid for the current surface size and
+                // comparing it to the currently rebuilt cell buffer grid. If they don't match, keep
+                // the last presented frame on-screen until the new cells arrive.
+                if (size_changed) {
+                    const expected_grid = (renderer.Size{
+                        .screen = .{ .width = surface_size.width, .height = surface_size.height },
+                        .cell = self.size.cell,
+                        .padding = self.size.padding,
+                    }).grid();
+
+                    if (expected_grid.columns != self.cells.size.columns or
+                        expected_grid.rows != self.cells.size.rows)
+                    {
+                        try self.api.presentLastTarget();
+                        return;
+                    }
                 }
             }
 
