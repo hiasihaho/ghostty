@@ -274,3 +274,14 @@ export fn ghostty_embed_surface_container_new(
     scrolled.setSurface(surface);
     return scrolled.as(gtk.Widget);
 }
+
+/// Focus the surface's input widget (the GLArea — the Surface bin itself
+/// is not focusable, so a plain gtk_widget_grab_focus on it relies on
+/// GTK's child delegation instead of Ghostty's intended focus target).
+export fn ghostty_embed_surface_grab_focus(widget: *gtk.Widget) void {
+    const surface = gobject.ext.cast(
+        Surface,
+        widget.as(gobject.Object),
+    ) orelse return;
+    surface.grabFocus();
+}

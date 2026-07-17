@@ -48,6 +48,11 @@ void* ghostty_embed_surface_new(const char* working_directory,
 // argument is not a GhosttySurface.
 void* ghostty_embed_surface_container_new(void* surface_widget);
 
+// Focus the surface's input widget (the inner GLArea). Use this instead
+// of gtk_widget_grab_focus on the surface widget, which is not focusable
+// itself.
+void ghostty_embed_surface_grab_focus(void* surface_widget);
+
 // Write bytes RAW to the surface's PTY (no paste encoding) — send_text /
 // send_key semantics, like vte_terminal_feed_child. Returns false while
 // the surface's shell isn't running yet (unrealized background pane).
