@@ -53,6 +53,11 @@ void* ghostty_embed_surface_container_new(void* surface_widget);
 // itself.
 void ghostty_embed_surface_grab_focus(void* surface_widget);
 
+// Toggle the surface's built-in search overlay (find-in-terminal). The
+// overlay handles needle entry, next/prev, highlighting, and
+// Escape-to-close itself. active=false hides it.
+void ghostty_embed_surface_set_search(void* surface_widget, bool active);
+
 // Write bytes RAW to the surface's PTY (no paste encoding) — send_text /
 // send_key semantics, like vte_terminal_feed_child. Returns false while
 // the surface's shell isn't running yet (unrealized background pane).

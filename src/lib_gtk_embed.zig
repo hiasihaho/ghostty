@@ -285,3 +285,18 @@ export fn ghostty_embed_surface_grab_focus(widget: *gtk.Widget) void {
     ) orelse return;
     surface.grabFocus();
 }
+
+/// Toggle the surface's built-in search overlay (find-in-terminal). The
+/// overlay owns everything once shown: needle entry, next/prev, match
+/// highlighting, Escape-to-close. `active=false` hides it. No-op if the
+/// widget is not a GhosttySurface.
+export fn ghostty_embed_surface_set_search(
+    widget: *gtk.Widget,
+    active: bool,
+) void {
+    const surface = gobject.ext.cast(
+        Surface,
+        widget.as(gobject.Object),
+    ) orelse return;
+    surface.setSearchActive(active, "");
+}
