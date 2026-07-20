@@ -1297,10 +1297,18 @@ pub const Application = extern struct {
         // Embedded in a foreign main loop: nothing calls tick for us
         // (run() never executes), so schedule one. Coalesce because
         // wakeup can fire from the renderer/IO threads in bursts;
-        // glib.idleAdd is thread-safe.
+        // g_idle_add_full is thread-safe. DEFAULT priority, not idle:
+        // idle sources starve behind input/redraw during scroll storms,
+        // which made embedded rendering lag its input (standalone
+        // ghostty ticks every loop iteration and never waits).
         if (embed_instance != null) {
             if (!embed_tick_pending.swap(true, .acq_rel)) {
-                _ = glib.idleAdd(embedTick, null);
+                _ = glib.idleAddFull(
+                    glib.PRIORITY_DEFAULT,
+                    embedTick,
+                    null,
+                    null,
+                );
             }
             return;
         }
