@@ -82,6 +82,19 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Feed data to the terminal as if it had arrived from the pty, and
+    /// free it afterwards. This is *output*, not input: it is parsed and
+    /// drawn, never sent to the child process.
+    ///
+    /// Added for embedders that need to restore previously captured
+    /// screen contents (cmux replays a pane's scrollback across a session
+    /// restart). Doing that with a write request would hand the text to
+    /// the shell as if the user had typed it.
+    ///
+    /// Handled on the io thread, where processOutput already runs, so the
+    /// terminal parser is still only driven from one thread.
+    inject_output: WriteReq.Alloc,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.

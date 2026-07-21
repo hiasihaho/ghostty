@@ -65,6 +65,15 @@ bool ghostty_embed_surface_send_text(void* widget,
                                      const unsigned char* bytes,
                                      size_t len);
 
+// Feed bytes to the terminal as OUTPUT — parsed and drawn, never sent to
+// the child process. This is what restores a pane's saved scrollback
+// after a restart; send_text would hand the text to the shell as if the
+// user had typed it. Returns false while the surface's shell isn't
+// running yet.
+bool ghostty_embed_surface_write_display(void* widget,
+                                         const unsigned char* bytes,
+                                         size_t len);
+
 // Read terminal text: the active screenful (ending at the cursor), or the
 // whole buffer including scrollback history. Returns a NUL-terminated
 // string to release with ghostty_embed_text_free, or NULL while the

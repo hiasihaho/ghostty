@@ -209,6 +209,25 @@ export fn ghostty_embed_surface_send_text(
     return true;
 }
 
+/// Feed text to the terminal as *output* — parsed and drawn, never sent
+/// to the child process. cmux uses this to replay a pane's saved
+/// scrollback after a session restart; doing that with send_text would
+/// hand the text to the shell as if the user had typed it.
+export fn ghostty_embed_surface_write_display(
+    widget: *gtk.Widget,
+    ptr: [*]const u8,
+    len: usize,
+) bool {
+    const core_surface = coreSurfaceFromWidget(widget) orelse return false;
+    if (len == 0) return true;
+    const copy = state.alloc.dupe(u8, ptr[0..len]) catch return false;
+    core_surface.queueIo(.{ .inject_output = .{
+        .alloc = state.alloc,
+        .data = copy,
+    } }, .unlocked);
+    return true;
+}
+
 /// Read terminal text: the active screen area ("screenful ending at the
 /// cursor", matching the host's VTE read_text) or, with
 /// `include_scrollback`, the whole screen buffer including history.

@@ -351,6 +351,11 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+
+            .inject_output => |v| {
+                defer v.alloc.free(v.data);
+                termio.Termio.processOutput(io, v.data);
+            },
         }
     }
 
