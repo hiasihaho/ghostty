@@ -3246,6 +3246,43 @@ pub const Surface = extern struct {
         SurfaceError,
     };
 
+    /// Embed-mode eager spawn (cmux gtk-embed shim): initialize the core
+    /// surface — shell spawn included — for a widget that is realized but
+    /// was never allocated. GTK never allocates hidden GtkStack children,
+    /// so a pane in a never-shown workspace otherwise waits for first
+    /// selection before its shell exists (`glareaResize` is the normal
+    /// init site and never fires for it). The stand-in size covers the
+    /// pty until the real resize corrects it on first map. Returns true
+    /// when the core surface exists on return.
+    pub fn ensureStarted(self: *Self) bool {
+        const priv = self.private();
+        if (priv.core_surface != null) return true;
+        if (priv.gl_area.as(gtk.Widget).getRealized() == 0) {
+            // The bin can be realized while the GLArea is not (tab-view
+            // page churn). Realizing an anchored widget is legal and
+            // does not map it; without an anchor there is no GL context
+            // to be had, so bail.
+            if (self.as(gtk.Widget).getRoot() == null) {
+                log.warn("ensureStarted: no root, cannot realize", .{});
+                return false;
+            }
+            priv.gl_area.as(gtk.Widget).realize();
+            if (priv.gl_area.as(gtk.Widget).getRealized() == 0) {
+                log.warn("ensureStarted: gl_area realize did not stick", .{});
+                return false;
+            }
+        }
+        if (priv.size.width == 0 or priv.size.height == 0) {
+            // ~80×24 grid at typical cell metrics.
+            priv.size = .{ .width = 720, .height = 432 };
+        }
+        self.initSurface() catch |err| {
+            log.warn("eager surface init failed err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     fn initSurface(self: *Self) InitError!void {
         const priv = self.private();
         assert(priv.core_surface == null);

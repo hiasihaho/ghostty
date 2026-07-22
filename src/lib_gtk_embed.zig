@@ -19,6 +19,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const apprt = @import("apprt.zig");
+const configpkg = @import("config.zig");
 const main = @import("main_ghostty.zig");
 const state = &@import("global.zig").state;
 const terminal = @import("terminal/main.zig");
@@ -114,6 +115,31 @@ export fn ghostty_embed_surface_new(
     env_values: ?[*]const [*:0]const u8,
     env_len: usize,
 ) ?*gtk.Widget {
+    return surfaceNewInternal(working_directory, env_keys, env_values, env_len, null);
+}
+
+/// Like ghostty_embed_surface_new, but the surface runs `command` (shell-
+/// expanded, `command` config key) instead of the user's shell — the
+/// respawn-pane primitive: the host tears the old surface down and mounts
+/// a replacement created through this, macOS-cmux style. When the command
+/// exits the surface's child-exited flow runs as usual.
+export fn ghostty_embed_surface_new_with_command(
+    working_directory: ?[*:0]const u8,
+    env_keys: ?[*]const [*:0]const u8,
+    env_values: ?[*]const [*:0]const u8,
+    env_len: usize,
+    command: ?[*:0]const u8,
+) ?*gtk.Widget {
+    return surfaceNewInternal(working_directory, env_keys, env_values, env_len, command);
+}
+
+fn surfaceNewInternal(
+    working_directory: ?[*:0]const u8,
+    env_keys: ?[*]const [*:0]const u8,
+    env_values: ?[*]const [*:0]const u8,
+    env_len: usize,
+    command: ?[*:0]const u8,
+) ?*gtk.Widget {
     if (embed_state.core_app == null) {
         log.err("ghostty_embed_surface_new before ghostty_embed_init", .{});
         return null;
@@ -121,13 +147,14 @@ export fn ghostty_embed_surface_new(
 
     const surface = Surface.new();
 
-    if (working_directory != null or env_len > 0) {
+    if (working_directory != null or env_len > 0 or command != null) {
         applySurfaceOverrides(
             surface,
             working_directory,
             env_keys,
             env_values,
             env_len,
+            command,
         ) catch |err| {
             log.err("per-surface config overrides failed error={}", .{err});
             surface.as(gobject.Object).unref();
@@ -136,6 +163,33 @@ export fn ghostty_embed_surface_new(
     }
 
     return surface.as(gtk.Widget);
+}
+
+/// Eagerly start a surface's shell (core surface init) when its widget is
+/// realized but was never allocated — panes in never-shown workspaces.
+/// The host must realize the widget subtree first. Idempotent; returns 1
+/// when the core surface exists on return.
+export fn ghostty_embed_surface_ensure_started(widget: *gtk.Widget) c_int {
+    const surface = gobject.ext.cast(
+        Surface,
+        widget.as(gobject.Object),
+    ) orelse return 0;
+    return @intFromBool(surface.ensureStarted());
+}
+
+/// Re-read the config from disk and propagate it — app level, which
+/// fans out to every live surface through the config-change machinery
+/// (same path as ghostty's own app.reload-config action).
+export fn ghostty_embed_reload_config() c_int {
+    const core_app = embed_state.core_app orelse return 0;
+    core_app.performAction(
+        &embed_state.rt_app,
+        .reload_config,
+    ) catch |err| {
+        log.warn("embed reload_config failed err={}", .{err});
+        return 0;
+    };
+    return 1;
 }
 
 /// Clone the app config, apply per-surface working-directory/env
@@ -147,6 +201,7 @@ fn applySurfaceOverrides(
     env_keys: ?[*]const [*:0]const u8,
     env_values: ?[*]const [*:0]const u8,
     env_len: usize,
+    command: ?[*:0]const u8,
 ) !void {
     const app = Application.default();
     const app_config = app.getConfig();
@@ -173,6 +228,12 @@ fn applySurfaceOverrides(
             });
             try core.env.parseCLI(arena, entry);
         }
+    }
+
+    if (command) |cmd| {
+        var parsed: configpkg.Command = undefined;
+        try parsed.parseCLI(arena, try arena.dupeZ(u8, std.mem.span(cmd)));
+        core.command = parsed;
     }
 
     surface.setConfig(surface_config);

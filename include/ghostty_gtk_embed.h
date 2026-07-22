@@ -40,6 +40,29 @@ void* ghostty_embed_surface_new(const char* working_directory,
                                 const char** env_values,
                                 size_t env_len);
 
+// Like ghostty_embed_surface_new, but the surface runs `command`
+// (shell-expanded, ghostty's `command` config key) instead of the user's
+// shell. The respawn-pane primitive: tear the old surface down, mount a
+// replacement created through this. When the command exits, the surface's
+// child-exited flow runs as usual. NULL command == plain surface_new.
+void* ghostty_embed_surface_new_with_command(const char* working_directory,
+                                             const char** env_keys,
+                                             const char** env_values,
+                                             size_t env_len,
+                                             const char* command);
+
+// Eagerly start a surface's shell (core-surface init) when its widget is
+// realized but never allocated — panes in never-shown workspaces, which
+// GTK never allocates and whose shells otherwise wait for first
+// selection. The host must realize the widget subtree first. Idempotent.
+// Returns 1 when the core surface exists on return.
+int ghostty_embed_surface_ensure_started(void* surface_widget);
+
+// Re-read the config from disk and propagate it to the app and every
+// live surface (ghostty's own app.reload-config action). Returns 1 on
+// success, 0 if the shim is uninitialized or the reload failed.
+int ghostty_embed_reload_config(void);
+
 // Wrap a surface widget in Ghostty's own scrolled-window container
 // (config-bound scrollbar visibility, horizontal scrolling disabled).
 // Use this as the pane child: a plain GtkScrolledWindow with automatic
