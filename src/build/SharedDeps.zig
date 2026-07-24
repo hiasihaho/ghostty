@@ -608,7 +608,9 @@ pub fn add(
     }
 
     // If we're building an exe then we have additional dependencies.
-    if (step.kind != .lib) {
+    // A lib with app_runtime=gtk (the Linux GTK embedding shim) needs the
+    // same GTK dependency set as the exe.
+    if (step.kind != .lib or self.config.app_runtime == .gtk) {
         // When we're targeting flatpak we ALWAYS link GTK so we
         // get access to glib for dbus.
         if (self.config.flatpak) step.linkSystemLibrary2("gtk4", dynamic_link_opts);

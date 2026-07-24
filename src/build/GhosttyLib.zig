@@ -195,6 +195,9 @@ pub fn initSharedGtk(
         .step = &lib.step,
         .output = lib.getEmittedBin(),
         .dsym = null,
+        .implib = null,
+        .pkg_config = null,
+        .pkg_config_static = null,
     };
 }
 
