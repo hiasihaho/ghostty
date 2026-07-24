@@ -499,6 +499,10 @@ fn queueMessageManual(self: *Termio, msg: termio.Message) void {
                 log.warn("manual inline write_alloc failed err={}", .{err});
             };
         },
+        .inject_output => |v| {
+            defer v.alloc.free(v.data);
+            self.processOutput(v.data);
+        },
     }
 
     self.renderer_wakeup.notify() catch |err| {
