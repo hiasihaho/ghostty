@@ -34,7 +34,9 @@ pub const swap_chain_count = 1;
 
 const log = std.log.scoped(.opengl);
 
-const is_embedded = build_config.artifact == .lib;
+// Artifact .lib alone is not "embedded runtime": the GTK embed lib (fork)
+// is a lib with app_runtime=gtk and must never analyze apprt.embedded.
+const is_embedded = build_config.artifact == .lib and build_config.app_runtime == .none;
 const GlProc = *const fn () callconv(.c) void;
 const EmbeddedState = if (is_embedded) struct {
     surface: *apprt.Surface,
@@ -197,19 +199,17 @@ fn prepareContext(getProcAddress: anytype) !void {
 
 /// This is called early right after surface creation.
 pub fn surfaceInit(surface: *apprt.Surface) !void {
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
+    // if-chain on the build enum, not a type switch: naming apprt.embedded
+    // as a case label under the GTK embed lib would force analysis of the
+    // embedded apprt, whose code assumes runtime == embedded.
+    if (comptime build_config.app_runtime == .gtk) {
         // GTK uses global OpenGL context so we load from null.
-        apprt.gtk,
-        => try prepareContext(null),
-
-        apprt.embedded => {
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
-        },
-    }
+        try prepareContext(null);
+    } else if (comptime is_embedded) {
+        try enterEmbedded(surface);
+        errdefer leaveEmbedded();
+        try prepareContext(&embeddedGetProcAddress);
+    } else @compileError("unsupported app runtime for OpenGL");
 
     // These are very noisy so this is commented, but easy to uncomment
     // whenever we need to check the OpenGL extension list
@@ -233,61 +233,46 @@ pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
 
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        apprt.gtk => {
-            // GTK doesn't support threaded OpenGL operations as far as I can
-            // tell, so we use the renderer thread to setup all the state
-            // but then do the actual draws and texture syncs and all that
-            // on the main thread. As such, we don't do anything here.
-        },
-
-        apprt.embedded => {
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
-        },
-    }
+    if (comptime build_config.app_runtime == .gtk) {
+        // GTK doesn't support threaded OpenGL operations as far as I can
+        // tell, so we use the renderer thread to setup all the state
+        // but then do the actual draws and texture syncs and all that
+        // on the main thread. As such, we don't do anything here.
+    } else if (comptime is_embedded) {
+        try enterEmbedded(surface);
+        errdefer leaveEmbedded();
+        try prepareContext(&embeddedGetProcAddress);
+    } else @compileError("unsupported app runtime for OpenGL");
 }
 
 /// Callback called by renderer.Thread when it exits.
 pub fn threadExit(self: *const OpenGL) void {
     _ = self;
 
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        apprt.gtk => {
-            // We don't need to do any unloading for GTK because we may
-            // be sharing the global bindings with other windows.
-        },
-
-        apprt.embedded => {
-            leaveEmbedded();
-        },
-    }
+    if (comptime build_config.app_runtime == .gtk) {
+        // We don't need to do any unloading for GTK because we may
+        // be sharing the global bindings with other windows.
+    } else if (comptime is_embedded) {
+        leaveEmbedded();
+    } else @compileError("unsupported app runtime for OpenGL");
 }
 
 pub fn displayRealized(self: *const OpenGL) void {
     _ = self;
 
-    switch (apprt.runtime) {
-        apprt.gtk => prepareContext(null) catch |err| {
+    if (comptime build_config.app_runtime == .gtk) {
+        prepareContext(null) catch |err| {
             log.warn(
                 "Error preparing GL context in displayRealized, err={}",
                 .{err},
             );
-        },
-
+        };
+    } else if (comptime is_embedded) {
         // Embedded contexts are prepared by surfaceInit and threadEnter. The
         // embedder owns one context for the surface lifetime and never enters
         // GTK's realize cycle, but the generic renderer still instantiates
         // this method for every OpenGL runtime.
-        apprt.embedded => {},
-
-        else => @compileError("unsupported app runtime for OpenGL"),
-    }
+    } else @compileError("unsupported app runtime for OpenGL");
 }
 
 /// Actions taken before doing anything in `drawFrame`.

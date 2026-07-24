@@ -23,7 +23,14 @@ comptime {
     // some of the C API. At runtime though we should never get these
     // functions unless we are building libghostty.
     if (!builtin.is_test) {
-        assert(apprt.runtime == apprt.embedded);
+        // The GTK embedding shim (lib-gtk, fork) also routes through this
+        // file for its C API exports. Compare the build-config enum, not
+        // apprt types: naming apprt.embedded here would force analysis of
+        // the embedded apprt (whose CAPI assumes runtime == embedded), and
+        // naming apprt.gtk would break non-GTK builds (no gtk/adw modules).
+        if (@import("build_config.zig").app_runtime != .gtk) {
+            assert(apprt.runtime == apprt.embedded);
+        }
     }
 }
 

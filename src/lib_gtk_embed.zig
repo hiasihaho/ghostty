@@ -145,7 +145,7 @@ fn surfaceNewInternal(
         return null;
     }
 
-    const surface = Surface.new();
+    const surface = Surface.new(.none);
 
     if (working_directory != null or env_len > 0 or command != null) {
         applySurfaceOverrides(
@@ -215,7 +215,8 @@ fn applySurfaceOverrides(
     const arena = core._arena.?.allocator();
 
     if (working_directory) |wd| {
-        core.@"working-directory" = try arena.dupe(u8, std.mem.span(wd));
+        // working-directory became a union (home/inherit/path) upstream.
+        core.@"working-directory" = .{ .path = try arena.dupe(u8, std.mem.span(wd)) };
     }
 
     if (env_len > 0) {

@@ -796,7 +796,9 @@ pub fn init(
     // libghostty allows the embedder to free a surface as soon as creation
     // returns. Wait until the renderer's stop watcher is armed so that teardown
     // cannot race thread startup and lose the stop notification.
-    if (comptime apprt.runtime == apprt.embedded)
+    // Build-enum comparison (.none selects the embedded apprt): naming
+    // apprt.embedded under the GTK embed lib would force its analysis.
+    if (comptime @import("build_config.zig").app_runtime == .none)
         self.renderer_thread.started.wait();
 
     // Start our IO thread
@@ -807,7 +809,7 @@ pub fn init(
     );
     self.io_thr.setName("io") catch {};
 
-    if (comptime apprt.runtime == apprt.embedded)
+    if (comptime @import("build_config.zig").app_runtime == .none)
         self.io_thread.started.wait();
 
     // Determine our initial window size if configured. We need to do this
