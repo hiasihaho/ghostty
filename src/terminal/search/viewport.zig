@@ -137,37 +137,35 @@ pub const ViewportSearch = struct {
         var node_ = fingerprint.nodes[0].prev;
         var added: usize = 0;
         while (node_) |node| : (node_ = node.prev) {
-            // If the last row of this node isn't wrapped we can't overlap.
-            const row = node.data.getRow(node.data.size.rows - 1);
-            if (!row.wrap) break;
-
             // We could be more accurate here and count bytes since the
             // last wrap but its complicated and unlikely multiple pages
             // wrap so this should be fine.
-            added += try self.window.append(node);
+            const appended = try self.window.appendIfWrapped(node) orelse break;
+            added += appended.content_len;
             if (added >= self.window.needle.len - 1) break;
         }
 
         // We can use our fingerprint nodes to initialize our sliding
         // window, since we already traversed the viewport once.
+        var end_append: SlidingWindow.AppendResult = undefined;
         for (fingerprint.nodes) |node| {
-            _ = try self.window.append(node);
+            end_append = try self.window.append(node);
         }
 
         // Add any trailing overlap as well.
         trailing: {
             const end: *PageList.List.Node = fingerprint.nodes[fingerprint.nodes.len - 1];
-            if (!end.data.getRow(end.data.size.rows - 1).wrap) break :trailing;
+            if (!end_append.last_row_wrapped) break :trailing;
 
             node_ = end.next;
             added = 0;
             while (node_) |node| : (node_ = node.next) {
-                added += try self.window.append(node);
+                const appended = try self.window.append(node);
+                added += appended.content_len;
                 if (added >= self.window.needle.len - 1) break;
 
                 // If this row doesn't wrap, then we can quit
-                const row = node.data.getRow(node.data.size.rows - 1);
-                if (!row.wrap) break;
+                if (!appended.last_row_wrapped) break;
             }
         }
 
@@ -223,7 +221,7 @@ test "simple search" {
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
+    s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
 
     var search: ViewportSearch = try .init(alloc, "Fizz");
     defer search.deinit();
@@ -266,15 +264,15 @@ test "clear screen and search" {
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
+    s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
 
     var search: ViewportSearch = try .init(alloc, "Fizz");
     defer search.deinit();
     try testing.expect(try search.update(&t.screens.active.pages));
 
-    try s.nextSlice("\x1b[2J"); // Clear screen
-    try s.nextSlice("\x1b[H"); // Move cursor home
-    try s.nextSlice("Buzz\r\nFizz\r\nBuzz");
+    s.nextSlice("\x1b[2J"); // Clear screen
+    s.nextSlice("\x1b[H"); // Move cursor home
+    s.nextSlice("Buzz\r\nFizz\r\nBuzz");
     try testing.expect(try search.update(&t.screens.active.pages));
 
     {
@@ -299,7 +297,7 @@ test "clear screen and search dirty tracking" {
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
+    s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
 
     var search: ViewportSearch = try .init(alloc, "Fizz");
     defer search.deinit();
@@ -313,9 +311,9 @@ test "clear screen and search dirty tracking" {
     // Should not update since nothing changed
     try testing.expect(!try search.update(&t.screens.active.pages));
 
-    try s.nextSlice("\x1b[2J"); // Clear screen
-    try s.nextSlice("\x1b[H"); // Move cursor home
-    try s.nextSlice("Buzz\r\nFizz\r\nBuzz");
+    s.nextSlice("\x1b[2J"); // Clear screen
+    s.nextSlice("\x1b[H"); // Move cursor home
+    s.nextSlice("Buzz\r\nFizz\r\nBuzz");
 
     // Should still not update since active area isn't dirty
     try testing.expect(!try search.update(&t.screens.active.pages));
@@ -348,17 +346,17 @@ test "history search, no active area" {
     defer s.deinit();
 
     // Fill up first page
-    const first_page_rows = t.screens.active.pages.pages.first.?.data.capacity.rows;
-    try s.nextSlice("Fizz\r\n");
-    for (1..first_page_rows - 1) |_| try s.nextSlice("\r\n");
+    const first_page_rows = t.screens.active.pages.pages.first.?.capacity().rows;
+    s.nextSlice("Fizz\r\n");
+    for (1..first_page_rows - 1) |_| s.nextSlice("\r\n");
     try testing.expect(t.screens.active.pages.pages.first == t.screens.active.pages.pages.last);
 
     // Create second page
-    try s.nextSlice("\r\n");
+    s.nextSlice("\r\n");
     try testing.expect(t.screens.active.pages.pages.first != t.screens.active.pages.pages.last);
-    try s.nextSlice("Buzz\r\nFizz");
+    s.nextSlice("Buzz\r\nFizz");
 
-    try t.scrollViewport(.top);
+    t.scrollViewport(.top);
 
     var search: ViewportSearch = try .init(alloc, "Fizz");
     defer search.deinit();

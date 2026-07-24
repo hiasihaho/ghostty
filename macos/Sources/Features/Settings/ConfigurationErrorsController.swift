@@ -12,13 +12,13 @@ class ConfigurationErrorsController: NSWindowController, NSWindowDelegate, Confi
     /// The data model for this view. Update this directly and the associated view will be updated, too.
     @Published var errors: [String] = [] {
         didSet {
-            if (errors.count == 0) {
+            if errors.count == 0 {
                 self.window?.performClose(nil)
             }
         }
     }
 
-    //MARK: - NSWindowController
+    // MARK: - NSWindowController
 
     override func windowWillLoad() {
         shouldCascadeWindows = false
@@ -29,5 +29,6 @@ class ConfigurationErrorsController: NSWindowController, NSWindowDelegate, Confi
         window.center()
         window.level = .popUpMenu
         window.contentView = NSHostingView(rootView: ConfigurationErrorsView(model: self))
+        window.titlebarAppearsTransparent = true
     }
 }

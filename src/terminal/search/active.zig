@@ -68,26 +68,22 @@ pub const ActiveSearch = struct {
             // page that contains the active area. We go to the previous
             // page once more since its the first page of our required
             // overlap.
-            if (rem <= node.data.size.rows) {
+            if (rem <= node.rows()) {
                 node_ = node.prev;
                 break;
             }
 
-            rem -= node.data.size.rows;
+            rem -= node.rows();
         }
 
         // Next, add enough overlap to cover needle.len - 1 bytes (if it
         // exists) so we can cover the overlap.
         while (node_) |node| : (node_ = node.prev) {
-            // If the last row of this node isn't wrapped we can't overlap.
-            const row = node.data.getRow(node.data.size.rows - 1);
-            if (!row.wrap) break;
-
             // We could be more accurate here and count bytes since the
             // last wrap but its complicated and unlikely multiple pages
             // wrap so this should be fine.
-            const added = try self.window.append(node);
-            if (added >= self.window.needle.len - 1) break;
+            const appended = try self.window.appendIfWrapped(node) orelse break;
+            if (appended.content_len >= self.window.needle.len - 1) break;
         }
 
         // Return the last node we added to our window.
@@ -108,7 +104,7 @@ test "simple search" {
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
+    s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
 
     var search: ActiveSearch = try .init(alloc, "Fizz");
     defer search.deinit();
@@ -148,15 +144,15 @@ test "clear screen and search" {
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
+    s.nextSlice("Fizz\r\nBuzz\r\nFizz\r\nBang");
 
     var search: ActiveSearch = try .init(alloc, "Fizz");
     defer search.deinit();
     _ = try search.update(&t.screens.active.pages);
 
-    try s.nextSlice("\x1b[2J"); // Clear screen
-    try s.nextSlice("\x1b[H"); // Move cursor home
-    try s.nextSlice("Buzz\r\nFizz\r\nBuzz");
+    s.nextSlice("\x1b[2J"); // Clear screen
+    s.nextSlice("\x1b[H"); // Move cursor home
+    s.nextSlice("Buzz\r\nFizz\r\nBuzz");
     _ = try search.update(&t.screens.active.pages);
 
     {

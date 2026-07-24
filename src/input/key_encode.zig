@@ -18,6 +18,12 @@ pub const Options = struct {
     /// Terminal DEC mode 66
     keypad_key_application: bool = false,
 
+    // DEC Backarrow Key Mode (DECBKM)
+    // See https://vt100.net/dec/ek-vt3xx-tp-002.pdf page 170
+    // If `false` (the default), `backspace` emits 0x7f
+    // If `true`, `backspace` emits 0x08
+    backarrow_key_mode: bool = false,
+
     /// Terminal DEC mode 1035
     ignore_keypad_with_numlock: bool = false,
 
@@ -55,6 +61,7 @@ pub const Options = struct {
             .alt_esc_prefix = t.modes.get(.alt_esc_prefix),
             .cursor_key_application = t.modes.get(.cursor_keys),
             .keypad_key_application = t.modes.get(.keypad_keys),
+            .backarrow_key_mode = t.modes.get(.backarrow_key_mode),
             .ignore_keypad_with_numlock = t.modes.get(.ignore_keypad_with_numlock),
             .modify_other_keys_state_2 = t.flags.modify_other_keys_2,
             .kitty_flags = t.screens.active.kitty_keyboard.current(),
@@ -159,7 +166,7 @@ fn kitty(
             switch (event.key) {
                 else => {},
                 inline .enter, .backspace => |tag| {
-                    // See legacy for why we handle this this way.
+                    // See legacy for why we handle this way.
                     if (isControlUtf8(event.utf8)) break :utf8;
                     if (comptime tag == .backspace) return;
                     return try writer.writeAll(event.utf8);
@@ -214,7 +221,13 @@ fn kitty(
         }
     }
 
-    const entry = entry_ orelse return;
+    const entry = entry_ orelse {
+        // No entry found. If we have UTF-8 text this is a pure text event
+        // (e.g. composed/IME text), so send it as-is so programs can
+        // still receive it.
+        if (event.utf8.len > 0) return try writer.writeAll(event.utf8);
+        return;
+    };
 
     // If this is just a modifier we require "report all" to send the sequence.
     if (entry.modifier and !opts.kitty_flags.report_all) return;
@@ -279,10 +292,12 @@ fn kitty(
         if (opts.kitty_flags.report_associated and
             seq.event != .release)
         associated: {
-            // Determine if the Alt modifier should be treated as an actual
-            // modifier (in which case it prevents associated text) or as
-            // the macOS Option key, which does not prevent associated text.
-            const alt_prevents_text = if (comptime builtin.os.tag == .macos)
+            // Alt consumed to produce this event's text is not an effective
+            // text-preventing modifier. Otherwise retain the platform's
+            // configured Alt-versus-Option behavior.
+            const alt_prevents_text = if (event.consumed_mods.alt)
+                false
+            else if (comptime builtin.os.tag == .macos)
                 switch (opts.macos_option_as_alt) {
                     .left => all_mods.sides.alt == .left,
                     .right => all_mods.sides.alt == .right,
@@ -332,6 +347,7 @@ fn legacy(
         opts.keypad_key_application,
         opts.ignore_keypad_with_numlock,
         opts.modify_other_keys_state_2,
+        opts.backarrow_key_mode,
     )) |sequence| pc_style: {
         // If we have UTF-8 text, then we never emit PC style function
         // keys. Many function keys (escape, enter, backspace) have
@@ -595,6 +611,7 @@ fn pcStyleFunctionKey(
     keypad_key_application_req: bool,
     ignore_keypad_with_numlock: bool,
     modify_other_keys: bool, // True if state 2
+    backarrow_key_mode: bool,
 ) ?[]const u8 {
     // We only want binding-sensitive mods because lock keys
     // and directional modifiers (left/right) don't matter for
@@ -646,6 +663,10 @@ fn pcStyleFunctionKey(
             // any set mods require an exact match
             continue;
         }
+
+        if (backarrow_key_mode)
+            if (entry.sequence_decbkm) |sequence|
+                return sequence;
 
         return entry.sequence;
     }
@@ -1239,9 +1260,20 @@ test "kitty: enter, backspace, tab" {
         try testing.expectEqualStrings("\r", writer.buffered());
     }
     {
+        // DECBKM reset
         var writer: std.Io.Writer = .fixed(&buf);
         try kitty(&writer, .{ .key = .backspace, .mods = .{}, .utf8 = "" }, .{
             .kitty_flags = .{ .disambiguate = true },
+            .backarrow_key_mode = false,
+        });
+        try testing.expectEqualStrings("\x7f", writer.buffered());
+    }
+    {
+        // DECBKM set (Kitty does not support DECBKM so there should be no change)
+        var writer: std.Io.Writer = .fixed(&buf);
+        try kitty(&writer, .{ .key = .backspace, .mods = .{}, .utf8 = "" }, .{
+            .kitty_flags = .{ .disambiguate = true },
+            .backarrow_key_mode = true,
         });
         try testing.expectEqualStrings("\x7f", writer.buffered());
     }
@@ -1441,6 +1473,25 @@ test "kitty: composing with modifier" {
         .kitty_flags = .{ .disambiguate = true, .report_all = true },
     });
     try testing.expectEqualStrings("\x1b[57441;2u", writer.buffered());
+}
+
+test "kitty: composed text with report all" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .unidentified,
+        .mods = .{},
+        .utf8 = "\xc3\xbb", // û
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_events = true,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        },
+    });
+    try testing.expectEqualStrings("\xc3\xbb", writer.buffered());
 }
 
 test "kitty: shift+a on US keyboard" {
@@ -1673,6 +1724,27 @@ test "kitty: report associated with alt text on macOS with option" {
     try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
 }
 
+test "kitty: report associated text produced by consumed alt" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .key_w,
+        .mods = .{ .alt = true },
+        .consumed_mods = .{ .alt = true },
+        .utf8 = "∑",
+        .unshifted_codepoint = 119,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_all = true,
+            .report_alternates = true,
+            .report_associated = true,
+        },
+        .macos_option_as_alt = .true,
+    });
+    try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
+}
+
 test "kitty: report associated with alt text on macOS with alt" {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
@@ -1863,6 +1935,43 @@ test "legacy: backspace with utf8 (dead key state)" {
     try testing.expectEqualStrings("", writer.buffered());
 }
 
+test "kitty: backspace (DECBKM reset) (report_all: true)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .backspace,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_events = true,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        },
+        .backarrow_key_mode = false,
+    });
+    try testing.expectEqualStrings("\x1b[127u", writer.buffered());
+}
+
+test "kitty: backspace (DECBKM set) (report_all: true)" {
+    // Kitty does not support DECBKM so there should be no difference.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .backspace,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_events = true,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        },
+        .backarrow_key_mode = true,
+    });
+    try testing.expectEqualStrings("\x1b[127u", writer.buffered());
+}
+
 test "legacy: enter with utf8 (dead key state)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2012,6 +2121,50 @@ test "legacy: ctrl+shift+backspace" {
         .mods = .{ .ctrl = true, .shift = true },
     }, .{});
     try testing.expectEqualStrings("\x08", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM reset)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{},
+    }, .{ .backarrow_key_mode = false });
+    try testing.expectEqualStrings("\x7f", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM reset, with ctrl)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{
+            .ctrl = true,
+        },
+    }, .{ .backarrow_key_mode = false });
+    try testing.expectEqualStrings("\x08", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM set)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{},
+    }, .{ .backarrow_key_mode = true });
+    try testing.expectEqualStrings("\x08", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM set, with ctrl)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{
+            .ctrl = true,
+        },
+    }, .{ .backarrow_key_mode = true });
+    try testing.expectEqualStrings("\x7f", writer.buffered());
 }
 
 test "legacy: ctrl+shift+char with modify other state 2" {
@@ -2330,15 +2483,26 @@ test "legacy: super and other mods on macOS with text" {
     try testing.expectEqualStrings("", writer.buffered());
 }
 
-test "legacy: backspace with DEL utf8" {
+test "legacy: backspace with DEL utf8 (DECBKM reset)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try legacy(&writer, .{
         .key = .backspace,
         .utf8 = &.{0x7F},
         .unshifted_codepoint = 0x08,
-    }, .{});
+    }, .{ .backarrow_key_mode = false });
     try testing.expectEqualStrings("\x7F", writer.buffered());
+}
+
+test "legacy: backspace with DEL utf8 (DECBKM set)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .utf8 = &.{0x7F},
+        .unshifted_codepoint = 0x08,
+    }, .{ .backarrow_key_mode = true });
+    try testing.expectEqualStrings("\x08", writer.buffered());
 }
 
 test "ctrlseq: normal ctrl c" {

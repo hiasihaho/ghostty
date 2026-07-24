@@ -8,7 +8,7 @@ const posix = std.posix;
 const fastmem = @import("../../fastmem.zig");
 const command = @import("graphics_command.zig");
 const PageList = @import("../PageList.zig");
-const wuffs = @import("wuffs");
+const sys = @import("../sys.zig");
 
 const temp_dir = struct {
     const TempDir = @import("../../os/TempDir.zig");
@@ -44,10 +44,52 @@ pub const LoadingImage = struct {
     /// used if q isn't set on subsequent chunks.
     quiet: command.Command.Quiet,
 
+    /// Maximum compressed, encoded, or decoded bytes retained while loading.
+    /// This is capped by max_size even if the storage limit is higher.
+    byte_limit: usize = max_size,
+
+    /// The limits of the Kitty Graphics protocol we should allow.
+    ///
+    /// This can be used to restrict the type of images and other
+    /// parameters for resource or security reasons. Note that depending
+    /// on how libghostty is compiled, some of these may be fully unsupported
+    /// and ignored (e.g. "file" on wasm32-freestanding).
+    pub const Limits = packed struct {
+        file: bool,
+        temporary_file: bool,
+        shared_memory: bool,
+
+        pub const all: Limits = .{
+            .file = true,
+            .temporary_file = true,
+            .shared_memory = true,
+        };
+
+        pub const direct: Limits = .{
+            .file = false,
+            .temporary_file = false,
+            .shared_memory = false,
+        };
+    };
+
     /// Initialize a chunked immage from the first image transmission.
     /// If this is a multi-chunk image, this should only be the FIRST
     /// chunk.
-    pub fn init(alloc: Allocator, cmd: *const command.Command) !LoadingImage {
+    pub fn init(
+        alloc: Allocator,
+        cmd: *const command.Command,
+        limits: Limits,
+    ) !LoadingImage {
+        return initWithLimit(alloc, cmd, limits, max_size);
+    }
+
+    /// Initialize an image while bounding all retained input and decoded data.
+    pub fn initWithLimit(
+        alloc: Allocator,
+        cmd: *const command.Command,
+        limits: Limits,
+        byte_limit: usize,
+    ) !LoadingImage {
         // Build our initial image from the properties sent via the control.
         // These can be overwritten by the data loading process. For example,
         // PNG loading sets the width/height from the data.
@@ -64,12 +106,34 @@ pub const LoadingImage = struct {
 
             .display = cmd.display(),
             .quiet = cmd.quiet,
+            .byte_limit = @min(byte_limit, max_size),
         };
+        errdefer result.deinit(alloc);
 
         // Special case for the direct medium, we just add the chunk directly.
         if (t.medium == .direct) {
             try result.addData(alloc, cmd.data);
             return result;
+        }
+
+        // Verify our capabilities and limits allow this.
+        {
+            // Special case if we don't support decoding PNGs and the format
+            // is a PNG we can save a lot of memory/effort buffering the
+            // data but failing up front.
+            if (t.format == .png and
+                sys.decode_png == null)
+            {
+                return error.UnsupportedMedium;
+            }
+
+            // Verify the medium is allowed
+            switch (t.medium) {
+                .direct => unreachable,
+                .file => if (!limits.file) return error.UnsupportedMedium,
+                .temporary_file => if (!limits.temporary_file) return error.UnsupportedMedium,
+                .shared_memory => if (!limits.shared_memory) return error.UnsupportedMedium,
+            }
         }
 
         // Otherwise, the payload data is guaranteed to be a path.
@@ -111,8 +175,9 @@ pub const LoadingImage = struct {
         t: command.Transmission,
         path: []const u8,
     ) !void {
+        // android does not support POSIX shared memory.
         // windows is currently unsupported, does it support shm?
-        if (comptime builtin.target.os.tag == .windows) {
+        if (comptime builtin.abi.isAndroid() or builtin.target.os.tag == .windows) {
             return error.UnsupportedMedium;
         }
 
@@ -154,8 +219,8 @@ pub const LoadingImage = struct {
             .png => stat_size,
 
             // For these formats we have a size we must have.
-            .gray, .gray_alpha, .rgb, .rgba => |f| size: {
-                const bpp = f.bpp();
+            .gray, .gray_alpha, .rgb, .rgba => size: {
+                const bpp = command.Transmission.formatBpp(self.image.format);
                 break :size self.image.width * self.image.height * bpp;
             },
         };
@@ -192,7 +257,7 @@ pub const LoadingImage = struct {
         ) else expected_size;
 
         assert(self.data.items.len == 0);
-        try self.data.appendSlice(alloc, map[start..end]);
+        try self.addData(alloc, map[start..end]);
     }
 
     /// Reads the data from a temporary file and returns it. This allocates
@@ -262,18 +327,25 @@ pub const LoadingImage = struct {
         var buf_reader = file.reader(&buf);
         const reader = &buf_reader.interface;
 
-        // Read the file
-        var managed: std.ArrayList(u8) = .empty;
-        errdefer managed.deinit(alloc);
-        const size: usize = if (t.size > 0) @min(t.size, max_size) else max_size;
-        reader.appendRemaining(alloc, &managed, .limited(size)) catch {
-            log.warn("failed to read temporary file: {?}", .{buf_reader.err});
-            return error.InvalidData;
-        };
-
-        // Set our data
         assert(self.data.items.len == 0);
-        self.data = .{ .items = managed.items, .capacity = managed.capacity };
+        var remaining: usize = if (t.size > 0)
+            @intCast(t.size)
+        else
+            std.math.maxInt(usize);
+        var chunk: [4096]u8 = undefined;
+        while (remaining > 0) {
+            const requested = @min(chunk.len, remaining);
+            const n = reader.readSliceShort(chunk[0..requested]) catch {
+                log.warn("failed to read temporary file: {?}", .{buf_reader.err});
+                return error.InvalidData;
+            };
+            if (n == 0) break;
+
+            // addData grows precisely and rejects the chunk before allocating
+            // if it would cross the configured storage byte limit.
+            try self.addData(alloc, chunk[0..n]);
+            remaining -= n;
+        }
     }
 
     /// Returns true if path appears to be in a temporary directory.
@@ -281,17 +353,16 @@ pub const LoadingImage = struct {
     fn isPathInTempDir(path: []const u8) bool {
         if (std.mem.startsWith(u8, path, "/tmp")) return true;
         if (std.mem.startsWith(u8, path, "/dev/shm")) return true;
-        if (temp_dir.allocTmpDir(std.heap.page_allocator)) |dir| {
-            defer temp_dir.freeTmpDir(std.heap.page_allocator, dir);
-            if (std.mem.startsWith(u8, path, dir)) return true;
+        const dir = temp_dir.allocTmpDir(std.heap.page_allocator) catch return false;
+        defer temp_dir.freeTmpDir(std.heap.page_allocator, dir);
+        if (std.mem.startsWith(u8, path, dir)) return true;
 
-            // The temporary dir is sometimes a symlink. On macOS for
-            // example /tmp is /private/var/...
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (posix.realpath(dir, &buf)) |real_dir| {
-                if (std.mem.startsWith(u8, path, real_dir)) return true;
-            } else |_| {}
-        }
+        // The temporary dir is sometimes a symlink. On macOS for
+        // example /tmp is /private/var/...
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (posix.realpath(dir, &buf)) |real_dir| {
+            if (std.mem.startsWith(u8, path, real_dir)) return true;
+        } else |_| {}
 
         return false;
     }
@@ -306,30 +377,81 @@ pub const LoadingImage = struct {
         alloc.destroy(self);
     }
 
+    /// Updates the configured loading limit. Returns false when bytes already
+    /// retained by this load exceed the new limit.
+    pub fn setByteLimit(self: *LoadingImage, limit: usize) bool {
+        self.byte_limit = @min(limit, max_size);
+        return self.data.items.len <= self.byte_limit and
+            self.data.capacity <= self.byte_limit;
+    }
+
     /// Adds a chunk of data to the image. Use this if the image
     /// is coming in chunks (the "m" parameter in the protocol).
     pub fn addData(self: *LoadingImage, alloc: Allocator, data: []const u8) !void {
         // If no data, skip
         if (data.len == 0) return;
 
-        // If our data would get too big, return an error
-        if (self.data.items.len + data.len > max_size) {
+        // If our data would get too big, return an error before growing the
+        // backing allocation. Check subtraction first to avoid overflow.
+        if (self.data.items.len > max_size or
+            data.len > max_size - self.data.items.len)
+        {
             log.warn("image data too large max_size={}", .{max_size});
             return error.InvalidData;
         }
+        if (self.data.items.len > self.byte_limit or
+            data.len > self.byte_limit - self.data.items.len)
+        {
+            log.warn("image data exceeds storage byte limit={}", .{self.byte_limit});
+            return error.OutOfMemory;
+        }
 
-        // Ensure we have enough room to add the data
-        // to the end of the ArrayList before doing so.
-        try self.data.ensureUnusedCapacity(alloc, data.len);
+        const new_len = self.data.items.len + data.len;
+        try ensureBoundedCapacity(
+            &self.data,
+            alloc,
+            new_len,
+            self.byte_limit,
+        );
 
         const start_i = self.data.items.len;
-        self.data.items.len = start_i + data.len;
+        self.data.items.len = new_len;
         fastmem.copy(u8, self.data.items[start_i..], data);
+    }
+
+    /// Grow geometrically so chunked inputs remain amortized linear while
+    /// never reserving more than the configured byte limit.
+    fn ensureBoundedCapacity(
+        list: *std.ArrayList(u8),
+        alloc: Allocator,
+        minimum: usize,
+        limit: usize,
+    ) Allocator.Error!void {
+        assert(minimum <= limit);
+        assert(limit <= max_size);
+        if (minimum <= list.capacity) return;
+
+        // Limits are capped at max_size, so this arithmetic cannot overflow.
+        const geometric = @min(
+            limit,
+            list.capacity + list.capacity / 2 + 8,
+        );
+        try list.ensureTotalCapacityPrecise(
+            alloc,
+            @max(minimum, geometric),
+        );
     }
 
     /// Complete the chunked image, returning a completed image.
     pub fn complete(self: *LoadingImage, alloc: Allocator) !Image {
         const img = &self.image;
+
+        // Raw formats have dimensions from the command, so validate their
+        // decoded resource requirement before decompression allocates output.
+        if (img.format != .png) {
+            const expected_len = try self.expectedDataLen();
+            if (expected_len > self.byte_limit) return error.OutOfMemory;
+        }
 
         // Decompress the data if it is compressed.
         try self.decompress(alloc);
@@ -337,15 +459,12 @@ pub const LoadingImage = struct {
         // Decode the png if we have to
         if (img.format == .png) try self.decodePng(alloc);
 
-        // Validate our dimensions.
-        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
-        if (img.width > max_dimension or img.height > max_dimension) return error.DimensionsTooLarge;
-
         // Data length must be what we expect
-        const bpp = img.format.bpp();
-        const expected_len = img.width * img.height * bpp;
+        const expected_len = try self.expectedDataLen();
+        if (expected_len > self.byte_limit) return error.OutOfMemory;
         const actual_len = self.data.items.len;
         if (actual_len != expected_len) {
+            const bpp = command.Transmission.formatBpp(img.format);
             std.log.warn(
                 "unexpected length image id={} width={} height={} bpp={} expected_len={} actual_len={}",
                 .{ img.id, img.width, img.height, bpp, expected_len, actual_len },
@@ -353,18 +472,31 @@ pub const LoadingImage = struct {
             return error.InvalidData;
         }
 
-        // Set our time
-        self.image.transmit_time = std.time.Instant.now() catch |err| {
-            log.warn("failed to get time: {}", .{err});
-            return error.InternalError;
-        };
-
         // Everything looks good, copy the image data over.
         var result = self.image;
         result.data = try self.data.toOwnedSlice(alloc);
         errdefer result.deinit(alloc);
         self.image = .{};
         return result;
+    }
+
+    fn expectedDataLen(self: *const LoadingImage) !usize {
+        const img = &self.image;
+        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
+        if (img.width > max_dimension or img.height > max_dimension) {
+            return error.DimensionsTooLarge;
+        }
+
+        const pixel_count = std.math.mul(
+            usize,
+            @intCast(img.width),
+            @intCast(img.height),
+        ) catch return error.DimensionsTooLarge;
+        return std.math.mul(
+            usize,
+            pixel_count,
+            command.Transmission.formatBpp(img.format),
+        ) catch return error.DimensionsTooLarge;
     }
 
     /// Debug function to write the data to a file. This is useful for
@@ -406,13 +538,36 @@ pub const LoadingImage = struct {
         var reader: std.Io.Reader = .fixed(self.data.items);
         var stream: std.compress.flate.Decompress = .init(&reader, .zlib, &buf);
 
-        // Write it to an array list
+        // Stream into precisely-sized growth so neither a compression bomb
+        // nor ArrayList capacity rounding can allocate beyond byte_limit.
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(alloc);
-        stream.reader.appendRemaining(alloc, &list, .limited(max_size)) catch {
-            log.warn("failed to read decompressed data: {?}", .{stream.err});
-            return error.DecompressionFailed;
-        };
+        var output: [4096]u8 = undefined;
+        while (true) {
+            const n = stream.reader.readSliceShort(&output) catch {
+                log.warn("failed to read decompressed data: {?}", .{stream.err});
+                return error.DecompressionFailed;
+            };
+            if (n == 0) break;
+            if (list.items.len > self.byte_limit or
+                n > self.byte_limit - list.items.len)
+            {
+                log.warn(
+                    "decompressed image exceeds storage byte limit={}",
+                    .{self.byte_limit},
+                );
+                return error.OutOfMemory;
+            }
+
+            const new_len = list.items.len + n;
+            try ensureBoundedCapacity(
+                &list,
+                alloc,
+                new_len,
+                self.byte_limit,
+            );
+            list.appendSliceAssumeCapacity(output[0..n]);
+        }
 
         // Empty our current data list, take ownership over managed array list
         self.data.deinit(alloc);
@@ -426,35 +581,97 @@ pub const LoadingImage = struct {
     fn decodePng(self: *LoadingImage, alloc: Allocator) !void {
         assert(self.image.format == .png);
 
-        const result = wuffs.png.decode(
+        // PNG dimensions are stored in the mandatory first IHDR chunk. Check
+        // the decoded RGBA requirement before the decoder allocates it.
+        const dimensions = try pngDimensions(self.data.items);
+        if (dimensions.width > max_dimension or dimensions.height > max_dimension) {
+            return error.DimensionsTooLarge;
+        }
+        const pixel_count = std.math.mul(
+            usize,
+            @intCast(dimensions.width),
+            @intCast(dimensions.height),
+        ) catch return error.DimensionsTooLarge;
+        const decoded_len = std.math.mul(
+            usize,
+            pixel_count,
+            command.Transmission.formatBpp(.rgba),
+        ) catch return error.DimensionsTooLarge;
+        if (decoded_len > max_size) return error.InvalidData;
+        if (decoded_len > self.byte_limit) return error.OutOfMemory;
+
+        const decode_png_fn = sys.decode_png orelse
+            return error.UnsupportedFormat;
+        const result = decode_png_fn(
             alloc,
             self.data.items,
         ) catch |err| switch (err) {
-            error.WuffsError => return error.InvalidData,
+            error.InvalidData => return error.InvalidData,
             error.OutOfMemory => return error.OutOfMemory,
-            error.Overflow => return error.InvalidData,
         };
-        defer alloc.free(result.data);
+        errdefer alloc.free(result.data);
 
-        if (result.data.len > max_size) {
-            log.warn("png image too large size={} max_size={}", .{ result.data.len, max_size });
+        if (result.width != dimensions.width or
+            result.height != dimensions.height or
+            result.data.len != decoded_len)
+        {
+            log.warn(
+                "png decoder result disagrees with IHDR expected={}x{} bytes={} actual={}x{} bytes={}",
+                .{
+                    dimensions.width,
+                    dimensions.height,
+                    decoded_len,
+                    result.width,
+                    result.height,
+                    result.data.len,
+                },
+            );
             return error.InvalidData;
         }
 
-        // Replace our data
+        // Replace the encoded bytes by taking ownership of the decoder output.
         self.data.deinit(alloc);
-        self.data = .{};
-        try self.data.ensureUnusedCapacity(alloc, result.data.len);
-        try self.data.appendSlice(alloc, result.data[0..result.data.len]);
+        self.data = .{
+            .items = result.data,
+            .capacity = result.data.len,
+        };
 
         // Store updated image dimensions
         self.image.width = result.width;
         self.image.height = result.height;
         self.image.format = .rgba;
     }
+
+    const PngDimensions = struct {
+        width: u32,
+        height: u32,
+    };
+
+    fn pngDimensions(data: []const u8) !PngDimensions {
+        const signature = "\x89PNG\r\n\x1a\n";
+        if (data.len < 24 or !std.mem.eql(u8, data[0..8], signature)) {
+            return error.InvalidData;
+        }
+        if (std.mem.readInt(u32, data[8..12], .big) != 13 or
+            !std.mem.eql(u8, data[12..16], "IHDR"))
+        {
+            return error.InvalidData;
+        }
+
+        const width = std.mem.readInt(u32, data[16..20], .big);
+        const height = std.mem.readInt(u32, data[20..24], .big);
+        if (width == 0 or height == 0) return error.InvalidData;
+        return .{ .width = width, .height = height };
+    }
 };
 
 /// Image represents a single fully loaded image.
+///
+/// The image data is always fully decoded raw pixels: loading inflates
+/// any zlib-compressed payload and decodes PNG into RGBA before an image
+/// is completed, so `compression` is always `.none` and `format` is
+/// never `.png` for a stored image, and `data.len` always equals
+/// `width * height * bytes-per-pixel`.
 pub const Image = struct {
     id: u32 = 0,
     number: u32 = 0,
@@ -463,7 +680,14 @@ pub const Image = struct {
     format: command.Transmission.Format = .rgb,
     compression: command.Transmission.Compression = .none,
     data: []const u8 = "",
-    transmit_time: std.time.Instant = undefined,
+
+    /// Unique, monotonically increasing stamp assigned each time an
+    /// image is added to (or replaced in) an ImageStorage. A changed
+    /// generation for a given image ID means the image contents may
+    /// have changed, even if the dimensions and byte length are the
+    /// same (e.g. a retransmission of the same ID). Stamps order by
+    /// transmission time. Zero means "never stored".
+    generation: u64 = 0,
 
     /// Set this to true if this image was loaded by a command that
     /// doesn't specify an ID or number, since such commands should
@@ -472,7 +696,6 @@ pub const Image = struct {
     implicit_id: bool = false,
 
     pub const Error = error{
-        InternalError,
         InvalidData,
         DecompressionFailed,
         DimensionsRequired,
@@ -522,7 +745,7 @@ test "image load with invalid RGB data" {
         .data = try alloc.dupe(u8, "AAAA"),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
 }
 
@@ -540,7 +763,7 @@ test "image load with image too wide" {
         .data = try alloc.dupe(u8, "AAAA"),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
     try testing.expectError(error.DimensionsTooLarge, loading.complete(alloc));
 }
@@ -559,7 +782,7 @@ test "image load with image too tall" {
         .data = try alloc.dupe(u8, "AAAA"),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
     try testing.expectError(error.DimensionsTooLarge, loading.complete(alloc));
 }
@@ -583,7 +806,7 @@ test "image load: rgb, zlib compressed, direct" {
         ),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
     var img = try loading.complete(alloc);
     defer img.deinit(alloc);
@@ -611,7 +834,7 @@ test "image load: rgb, not compressed, direct" {
         ),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
     var img = try loading.complete(alloc);
     defer img.deinit(alloc);
@@ -640,7 +863,7 @@ test "image load: rgb, zlib compressed, direct, chunked" {
         .data = try alloc.dupe(u8, data[0..1024]),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
 
     // Read our remaining chunks
@@ -676,7 +899,7 @@ test "image load: rgb, zlib compressed, direct, chunked with zero initial chunk"
         } },
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
     defer loading.deinit(alloc);
 
     // Read our remaining chunks
@@ -720,7 +943,7 @@ test "image load: temporary file without correct path" {
         .data = try alloc.dupe(u8, path),
     };
     defer cmd.deinit(alloc);
-    try testing.expectError(error.TemporaryFileNotNamedCorrectly, LoadingImage.init(alloc, &cmd));
+    try testing.expectError(error.TemporaryFileNotNamedCorrectly, LoadingImage.init(alloc, &cmd, .all));
 
     // Temporary file should still be there
     try tmp_dir.dir.access(path, .{});
@@ -753,7 +976,7 @@ test "image load: rgb, not compressed, temporary file" {
         .data = try alloc.dupe(u8, path),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .all);
     defer loading.deinit(alloc);
     var img = try loading.complete(alloc);
     defer img.deinit(alloc);
@@ -790,7 +1013,7 @@ test "image load: rgb, not compressed, regular file" {
         .data = try alloc.dupe(u8, path),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .all);
     defer loading.deinit(alloc);
     var img = try loading.complete(alloc);
     defer img.deinit(alloc);
@@ -799,6 +1022,8 @@ test "image load: rgb, not compressed, regular file" {
 }
 
 test "image load: png, not compressed, regular file" {
+    if (sys.decode_png == null) return error.SkipZigTest;
+
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -825,11 +1050,265 @@ test "image load: png, not compressed, regular file" {
         .data = try alloc.dupe(u8, path),
     };
     defer cmd.deinit(alloc);
-    var loading = try LoadingImage.init(alloc, &cmd);
+    var loading = try LoadingImage.init(alloc, &cmd, .all);
     defer loading.deinit(alloc);
     var img = try loading.complete(alloc);
     defer img.deinit(alloc);
     try testing.expect(img.compression == .none);
     try testing.expect(img.format == .rgba);
     try tmp_dir.dir.access(path, .{});
+}
+
+test "image load: png decoded size is rejected before decoder allocation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Decoder = struct {
+        var called: bool = false;
+
+        fn decode(_: Allocator, _: []const u8) sys.DecodeError!sys.Image {
+            called = true;
+            return error.InvalidData;
+        }
+    };
+
+    const previous_decoder = sys.decode_png;
+    defer sys.decode_png = previous_decoder;
+    Decoder.called = false;
+    sys.decode_png = &Decoder.decode;
+
+    // A valid PNG signature and IHDR declaring 5x5 RGBA pixels. The encoded
+    // header fits the 64-byte limit, but its 100 decoded bytes do not.
+    const png_header = [_]u8{
+        0x89, 'P',  'N',  'G',  '\r', '\n', 0x1A, '\n',
+        0x00, 0x00, 0x00, 0x0D, 'I',  'H',  'D',  'R',
+        0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x05,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    };
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .png,
+            .medium = .direct,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, &png_header),
+    };
+    defer cmd.deinit(alloc);
+
+    var loading = try LoadingImage.initWithLimit(alloc, &cmd, .direct, 64);
+    defer loading.deinit(alloc);
+    try testing.expectError(error.OutOfMemory, loading.complete(alloc));
+    try testing.expect(!Decoder.called);
+}
+
+test "image load: file input never allocates beyond byte limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const byte_limit = 4096;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    const data = [_]u8{0xA5} ** (byte_limit + 1);
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "image.data",
+        .data = &data,
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("image.data", &path_buf);
+    var loading: LoadingImage = .{
+        .image = .{},
+        .quiet = .no,
+        .byte_limit = byte_limit,
+    };
+    defer loading.deinit(alloc);
+
+    try testing.expectError(
+        error.OutOfMemory,
+        loading.readFile(.file, alloc, .{ .medium = .file }, path),
+    );
+    try testing.expectEqual(byte_limit, loading.data.items.len);
+    try testing.expectEqual(byte_limit, loading.data.capacity);
+}
+
+test "image load: chunked input grows geometrically within byte limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const byte_limit = 1024;
+    var loading: LoadingImage = .{
+        .image = .{},
+        .quiet = .no,
+        .byte_limit = byte_limit,
+    };
+    defer loading.deinit(alloc);
+
+    for (0..513) |_| try loading.addData(alloc, "x");
+
+    try testing.expectEqual(@as(usize, 513), loading.data.items.len);
+    try testing.expect(loading.data.capacity > loading.data.items.len);
+    try testing.expect(loading.data.capacity <= byte_limit);
+    const capacity = loading.data.capacity;
+    try testing.expectError(
+        error.OutOfMemory,
+        loading.addData(alloc, &([_]u8{0xA5} ** 512)),
+    );
+    try testing.expectEqual(capacity, loading.data.capacity);
+}
+
+test "limits: direct medium always allowed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .direct,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, "AAAA"),
+    };
+    defer cmd.deinit(alloc);
+
+    // Direct medium should work even with the most restrictive limits
+    var loading = try LoadingImage.init(alloc, &cmd, .direct);
+    defer loading.deinit(alloc);
+}
+
+test "limits: file medium blocked by limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    const data = @embedFile("testdata/image-rgb-none-20x15-2147483647-raw.data");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "image.data",
+        .data = data,
+    });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("image.data", &buf);
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .file,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+    defer cmd.deinit(alloc);
+    try testing.expectError(error.UnsupportedMedium, LoadingImage.init(alloc, &cmd, .direct));
+}
+
+test "limits: file medium allowed by limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    const data = @embedFile("testdata/image-rgb-none-20x15-2147483647-raw.data");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "image.data",
+        .data = data,
+    });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("image.data", &buf);
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .file,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+    defer cmd.deinit(alloc);
+    var loading = try LoadingImage.init(alloc, &cmd, .{
+        .file = true,
+        .temporary_file = false,
+        .shared_memory = false,
+    });
+    defer loading.deinit(alloc);
+}
+
+test "limits: temporary file medium blocked by limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    const data = @embedFile("testdata/image-rgb-none-20x15-2147483647-raw.data");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "tty-graphics-protocol-image.data",
+        .data = data,
+    });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("tty-graphics-protocol-image.data", &buf);
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .temporary_file,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+    defer cmd.deinit(alloc);
+    try testing.expectError(error.UnsupportedMedium, LoadingImage.init(alloc, &cmd, .{
+        .file = true,
+        .temporary_file = false,
+        .shared_memory = true,
+    }));
+
+    // File should still exist since we blocked before reading
+    try tmp_dir.dir.access("tty-graphics-protocol-image.data", .{});
+}
+
+test "limits: temporary file medium allowed by limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    const data = @embedFile("testdata/image-rgb-none-20x15-2147483647-raw.data");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "tty-graphics-protocol-image.data",
+        .data = data,
+    });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("tty-graphics-protocol-image.data", &buf);
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .temporary_file,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+    defer cmd.deinit(alloc);
+    var loading = try LoadingImage.init(alloc, &cmd, .{
+        .file = false,
+        .temporary_file = true,
+        .shared_memory = false,
+    });
+    defer loading.deinit(alloc);
 }

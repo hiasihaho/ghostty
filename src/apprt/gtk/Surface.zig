@@ -2,6 +2,7 @@ const Self = @This();
 
 const std = @import("std");
 const apprt = @import("../../apprt.zig");
+const configpkg = @import("../../config.zig");
 const CoreSurface = @import("../../Surface.zig");
 const ApprtApp = @import("App.zig");
 const Application = @import("class/application.zig").Application;
@@ -12,6 +13,16 @@ surface: *Surface,
 
 pub fn deinit(self: *Self) void {
     _ = self;
+}
+
+/// Keep the GObject and its embedded runtime surface alive while an app action
+/// invokes a potentially reentrant host callback.
+pub fn retainForAppAction(self: *Self) void {
+    _ = self.surface.ref();
+}
+
+pub fn releaseForAppAction(self: *Self) void {
+    self.surface.unref();
 }
 
 /// Returns the GObject surface for this apprt surface. This is a function

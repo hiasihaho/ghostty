@@ -43,6 +43,42 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// Keeps prepared frame damage retryable until every fallible draw stage has
+/// completed. A failure forces the next draw through the full redraw path even
+/// if size or other mutable renderer state changed before the error surfaced.
+const DrawDamageCommit = struct {
+    cells_rebuilt: *bool,
+    committed: bool = false,
+
+    fn begin(cells_rebuilt: *bool) DrawDamageCommit {
+        cells_rebuilt.* = false;
+        return .{ .cells_rebuilt = cells_rebuilt };
+    }
+
+    fn commit(self: *DrawDamageCommit) void {
+        self.committed = true;
+    }
+
+    fn deinit(self: *DrawDamageCommit) void {
+        if (!self.committed) self.cells_rebuilt.* = true;
+    }
+};
+
+fn advanceShaperCellIndexToX(
+    run_offset: usize,
+    shaped_cells: []const font.shape.Cell,
+    shaper_cells_i: *usize,
+    x: usize,
+) void {
+    // A text run can contain terminal cells that produce no shaped glyphs
+    // (for example, an empty tail after IME preedit covered the only glyph).
+    while (shaper_cells_i.* < shaped_cells.len and
+        run_offset + shaped_cells[shaper_cells_i.*].x < x)
+    {
+        shaper_cells_i.* += 1;
+    }
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -125,6 +161,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scrollbar: terminal.Scrollbar,
         scrollbar_dirty: bool,
 
+        /// Tracks the last bottom-right pin of the screen to detect new output.
+        /// When the final line changes (node or y differs), new content was added.
+        /// Used for scroll-to-bottom on output feature.
+        last_bottom_node: ?usize,
+        last_bottom_y: terminal.size.CellCountInt,
+
         /// The most recent viewport matches so that we can render search
         /// matches in the visible frame. This is provided asynchronously
         /// from the search thread so we have the dirty flag to also note
@@ -145,7 +187,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// to determine if any possible changes have been made to the
         /// cells for the draw call.
         cells_rebuilt: bool = false,
-
 
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
@@ -197,11 +238,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
-        /// True once we've successfully presented at least one frame. Used to
-        /// safely re-present the last target during synchronous resize callbacks
-        /// without risking an initial blank window.
-        has_presented: std.atomic.Value(bool) = .{ .raw = false },
-
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
 
@@ -244,15 +280,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This is comptime because there isn't a good reason to change
             // this at runtime and there is a lot of complexity to support it.
             const buf_count = GraphicsAPI.swap_chain_count;
+            const LeasePool = renderer.frame_lease.Pool(buf_count);
+
+            // cmux iOS fork: bounded acquire deadline for `nextFrame`. On iOS
+            // `render_now` produces frames synchronously on a single serial
+            // dispatch queue (no renderer-thread vsync pump); the permit is
+            // only reposted by the async GPU completion handler
+            // (`frameCompleted` -> `releaseFrame`). During a foreground
+            // pinch-zoom storm those completions can stall, so an UNBOUNDED
+            // wait here parks that queue forever and the terminal freezes.
+            // A healthy frame acquires in ~8-16ms (DRAW_INTERVAL=8 => 120 FPS),
+            // so 250ms is ~15-30x headroom: it never trips on a healthy frame
+            // but converts a stalled acquire into a recoverable SKIP. This is a
+            // recovery DEADLINE, not a poll/settle loop.
+            const frame_acquire_timeout_ns: u64 = 250 * std.time.ns_per_ms;
 
             /// `buf_count` structs that can hold the
             /// data needed by the GPU to draw a frame.
             frames: [buf_count]FrameState,
-            /// Index of the most recently used frame state struct.
-            frame_index: std.math.IntFittingRange(0, buf_count) = 0,
-            /// Semaphore that we wait on to make sure we have an available
-            /// frame state struct so we can start working on a new frame.
-            frame_sema: std.Thread.Semaphore = .{ .permits = buf_count },
+            /// Exact-slot ownership and generation tokens for the swap chain.
+            /// The GPU and an external compositor may release frames out of
+            /// submission order, so a bare counting semaphore is insufficient.
+            leases: LeasePool = .{},
 
             /// Set to true when deinited, if you try to deinit a defunct
             /// swap chain it will just be ignored, to prevent double-free.
@@ -276,28 +325,85 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pub fn deinit(self: *SwapChain) void {
                 if (self.defunct) return;
                 self.defunct = true;
+                self.leases.beginDeinit();
 
-                // Wait for all of our inflight draws to complete
-                // so that we can cleanly deinit our GPU state.
-                for (0..buf_count) |_| self.frame_sema.wait();
-                for (&self.frames) |*frame| frame.deinit();
+                // Wait for all of our inflight draws to complete so that we can
+                // cleanly deinit our GPU state. cmux iOS fork: bound each wait
+                // on iOS so a stalled GPU completion or host-held external
+                // lease cannot deadlock teardown. The lease pool returns exact
+                // idle slots; after the deadline we deinit those and leak only
+                // slots still owned by the GPU or host. `defunct` is already
+                // set, so no new acquire races us.
+                if (comptime builtin.os.tag == .ios) {
+                    var acquired: usize = 0;
+                    while (acquired < buf_count) : (acquired += 1) {
+                        const index = self.leases.takeForDeinit(
+                            frame_acquire_timeout_ns,
+                        ) catch break;
+                        self.frames[index].deinit();
+                    }
+                } else {
+                    for (0..buf_count) |_| {
+                        const index = self.leases.takeForDeinit(null) catch unreachable;
+                        self.frames[index].deinit();
+                    }
+                }
             }
+
+            const AcquiredFrame = struct {
+                state: *FrameState,
+                token: renderer.frame_lease.Token,
+            };
 
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
-            /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) error{Defunct}!*FrameState {
+            /// always be paired with a call to finishFrame.
+            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!AcquiredFrame {
                 if (self.defunct) return error.Defunct;
 
-                self.frame_sema.wait();
-                errdefer self.frame_sema.post();
-                self.frame_index = (self.frame_index + 1) % buf_count;
-                return &self.frames[self.frame_index];
+                // cmux iOS fork: bound the acquire so a stalled GPU completion
+                // can't wedge the serial output queue (see
+                // `frame_acquire_timeout_ns`). On timeout NO permit is consumed
+                // (Zig 0.15.2 Semaphore.timedWait decrements only after a real
+                // acquire), so balance is preserved and the frame is skipped.
+                // macOS/OpenGL keep the proven unbounded wait (they drive
+                // frames from the renderer-thread vsync loop where this is
+                // legitimate backpressure, never a serial-queue wedge).
+                const lease = try self.leases.acquire(if (comptime builtin.os.tag == .ios)
+                    frame_acquire_timeout_ns
+                else
+                    null);
+                return .{
+                    .state = &self.frames[lease.slot],
+                    .token = lease.token,
+                };
             }
 
-            /// This should be called when the frame has completed drawing.
-            pub fn releaseFrame(self: *SwapChain) void {
-                self.frame_sema.post();
+            /// Mark a GPU-complete frame as entering the external presentation
+            /// callback. Host releases are accepted after this transition.
+            pub fn beginExternalPresentation(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.beginPresentation(token);
+            }
+
+            /// This should be called exactly once when GPU completion and any
+            /// external presentation callback have both finished.
+            pub fn finishFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+                host_acquired: bool,
+            ) bool {
+                return self.leases.finish(token, host_acquired);
+            }
+
+            /// Release a frame previously acquired by the external host.
+            pub fn releaseExternalFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.releaseHost(token);
             }
         };
 
@@ -554,7 +660,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             search_foreground: configpkg.Config.TerminalColor,
             search_selected_background: configpkg.Config.TerminalColor,
             search_selected_foreground: configpkg.Config.TerminalColor,
-            bold_color: ?configpkg.BoldColor,
+            bold_color: ?terminal.Style.BoldColor,
             faint_opacity: u8,
             min_contrast: f32,
             padding_color: configpkg.WindowPaddingColor,
@@ -569,6 +675,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             colorspace: configpkg.Config.WindowColorspace,
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
+            macos_background_from_layer: bool,
+            scroll_to_bottom_on_output: bool,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -618,7 +726,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
-                    .bold_color = config.@"bold-color",
+                    .bold_color = if (config.@"bold-color") |b| b.toTerminal() else null,
                     .faint_opacity = @intFromFloat(@ceil(config.@"faint-opacity" * 255)),
 
                     .min_contrast = @floatCast(config.@"minimum-contrast"),
@@ -642,6 +750,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .colorspace = config.@"window-colorspace",
                     .blending = config.@"alpha-blending",
                     .background_blur = config.@"background-blur",
+                    .macos_background_from_layer = config.@"macos-background-from-layer",
+                    .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
             }
@@ -688,10 +798,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             const display_link: ?DisplayLink = switch (builtin.os.tag) {
-                .macos => if (options.config.vsync)
-                    try macos.video.DisplayLink.createWithActiveCGDisplays()
-                else
-                    null,
+                .macos => if (options.config.vsync) display_link: {
+                    break :display_link macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
+                        log.warn(
+                            "error creating display link, falling back to non-vsync renderer loop err={}",
+                            .{err},
+                        );
+                        break :display_link null;
+                    };
+                } else null,
                 else => null,
             };
             errdefer if (display_link) |v| v.release();
@@ -705,6 +820,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .focused = true,
                 .scrollbar = .zero,
                 .scrollbar_dirty = false,
+                .last_bottom_node = null,
+                .last_bottom_y = 0,
                 .search_matches = null,
                 .search_selected_match = null,
                 .search_matches_dirty = false,
@@ -725,9 +842,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         options.config.background.r,
                         options.config.background.g,
                         options.config.background.b,
-                        // Note that if we're on macOS with glass effects
-                        // we'll disable background opacity but we handle
-                        // that in updateFrame.
+                        // Glass effects and layer-background mode zero this
+                        // out in updateFrame; use the config value for now.
                         @intFromFloat(@round(options.config.background_opacity * 255.0)),
                     },
                     .bools = .{
@@ -752,6 +868,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .previous_cursor = @splat(0),
                     .current_cursor_color = @splat(0),
                     .previous_cursor_color = @splat(0),
+                    .current_cursor_style = 0,
+                    .previous_cursor_style = 0,
+                    .cursor_visible = 0,
                     .cursor_change_time = 0,
                     .time_focus = 0,
                     .focus = 1, // assume focused initially
@@ -791,11 +910,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (@hasDecl(GraphicsAPI, "prepareDeinit")) {
+                self.api.prepareDeinit();
+            }
+
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -944,12 +1070,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // marked defunct. If not, we have a problem.
             assert(self.swap_chain.defunct);
 
-            // We reinitialize our shaders and our swap chain.
+            // Reinitialize shaders and the swap chain before installing a
+            // distinct completion generation. If any step fails, leave this
+            // renderer unrealized and safe to retry.
             try self.initShaders();
-            self.swap_chain = try SwapChain.init(
+            errdefer self.shaders.deinit(self.alloc);
+            var swap_chain = try SwapChain.init(
                 self.api,
                 self.has_custom_shaders,
             );
+            errdefer swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "startFrameGeneration")) {
+                try self.api.startFrameGeneration();
+            }
+            self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
         }
@@ -973,6 +1107,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This will mark them as defunct so that they
             // can't be double-freed or used in draw calls.
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
             self.shaders.deinit(self.alloc);
         }
 
@@ -996,19 +1133,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
             log.info("updating display link display id={}", .{id});
-            const was_running = display_link.isRunning();
             display_link.setCurrentCGDisplay(id) catch |err| {
                 log.warn("error setting display link display id err={}", .{err});
-                return;
             };
-
-            // CVDisplayLink can silently "run" without ever delivering callbacks if it
-            // was started before a valid current display was set. Restarting it after
-            // we successfully set the display fixes the stuck-vsync-no-frames state.
-            if (was_running and self.focused) {
-                display_link.stop() catch {};
-                display_link.start() catch {};
-            }
         }
 
         /// True if our renderer has animations so that a higher frequency
@@ -1158,6 +1285,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
+                regex_always: link.PreparedAlways,
+                regex_hover: ?link.PreparedHover,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1173,8 +1302,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //     std.log.err("[updateFrame critical time] start={}\tduration={} us", .{ start_micro, end.since(start) / std.time.ns_per_us });
                 // }
 
-                state.mutex.lock();
-                defer state.mutex.unlock();
+                // Lock while signaling demand so the IO parse thread
+                // can't starve us. See renderer.State.lockDemand.
+                state.lockDemand();
+                defer state.unlockDemand();
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
@@ -1182,8 +1313,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 }
 
-                // Update our terminal state
-                try self.terminal_state.update(self.alloc, state.terminal);
+                // If scroll-to-bottom on output is enabled, check if the final line
+                // changed by comparing the bottom-right pin. If the node pointer or
+                // y offset changed, new content was added to the screen.
+                // Update this BEFORE we update our render state so we can
+                // draw the new scrolled data immediately.
+                if (self.config.scroll_to_bottom_on_output) scroll: {
+                    const br = state.terminal.screens.active.pages.getBottomRight(.screen) orelse break :scroll;
+
+                    // If the pin hasn't changed, then don't scroll.
+                    if (self.last_bottom_node == @intFromPtr(br.node) and
+                        self.last_bottom_y == br.y) break :scroll;
+
+                    // Update tracked pin state for next frame
+                    self.last_bottom_node = @intFromPtr(br.node);
+                    self.last_bottom_y = br.y;
+
+                    // Scroll
+                    state.terminal.scrollViewport(.bottom);
+                }
+
+                // Begin the update of our terminal state. Work that
+                // doesn't require terminal access (e.g. style
+                // denormalization) is deferred to the endUpdate call
+                // outside of this critical section, keeping our lock
+                // hold time as short as possible.
+                try self.terminal_state.beginUpdate(
+                    self.alloc,
+                    state.terminal,
+                );
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1212,6 +1370,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // kitty state on every frame because any cell change can move
                 // an image.
                 if (self.images.kittyRequiresUpdate(state.terminal)) {
+                    // We need to grab the draw mutex since this updates
+                    // our image state that drawFrame uses.
+                    self.draw_mutex.lock();
+                    defer self.draw_mutex.unlock();
                     self.images.kittyUpdate(
                         self.alloc,
                         state.terminal,
@@ -1241,6 +1403,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
+                // OSC8 is the canonical link when present. Otherwise copy
+                // regex candidates and stable cell identities while the
+                // terminal lock is held, then run regexes after unlocking.
+                const regex_hover: ?link.PreparedHover = regex_hover: {
+                    break :regex_hover self.config.links.prepareHover(
+                        arena_alloc,
+                        state.terminal.screens.active,
+                        state.mouse.point,
+                        state.mouse.mods,
+                        links.count() > 0,
+                    ) catch |err| {
+                        log.warn("error preparing regex links err={}", .{err});
+                        break :regex_hover null;
+                    };
+                };
+
+                const regex_always = self.config.links.prepareAlways(
+                    arena_alloc,
+                    state.terminal.screens.active,
+                    state.mouse.mods,
+                ) catch |err| always: {
+                    log.warn("error preparing always regex links err={}", .{err});
+                    break :always link.PreparedAlways{};
+                };
+
                 const overlay_features: []const Overlay.Feature = overlay: {
                     const insp = state.inspector orelse break :overlay &.{};
                     const renderer_info = insp.rendererInfo();
@@ -1251,6 +1438,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 break :critical .{
                     .links = links,
+                    .regex_always = regex_always,
+                    .regex_hover = regex_hover,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1258,16 +1447,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             };
 
-            // Outside the critical area we can update our links to contain
-            // our regex results.
-            self.config.links.renderCellMap(
+            // Outside the critical area, complete the update we began
+            // within it. This must be done before anything reads the
+            // render state (e.g. rebuildCells).
+            self.terminal_state.endUpdate();
+
+            self.config.links.renderPreparedAlways(
                 arena_alloc,
                 &critical.links,
-                &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                critical.regex_always,
+                critical.mouse.mods,
             ) catch |err| {
-                log.warn("error searching for regex links err={}", .{err});
+                log.warn("error searching for always regex links err={}", .{err});
+            };
+
+            // Interactive resolution then canonicalizes the pointer's
+            // candidate domain, including mixed always and hover priority.
+            // Regex evaluation stays outside the terminal critical section.
+            if (critical.regex_hover) |prepared| self.config.links.renderPreparedHover(
+                arena_alloc,
+                &critical.links,
+                prepared,
+                critical.mouse.mods,
+            ) catch |err| {
+                log.warn("error resolving regex hover link err={}", .{err});
             };
 
             // Clear our highlight state and update.
@@ -1339,9 +1542,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
-                _ = self.terminal_state.rows;
-                _ = self.terminal_state.cols;
-
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1375,16 +1575,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
-                // If we're on macOS and have glass styles, we remove
-                // the background opacity because the glass effect handles
-                // it.
-                if (comptime builtin.os.tag == .macos) switch (self.config.background_blur) {
-                    .@"macos-glass-regular",
-                    .@"macos-glass-clear",
-                    => self.uniforms.bg_color[3] = 0,
+                // On macOS, glass styles and plain layer-background mode
+                // zero bg_color alpha so that per-cell backgrounds in the
+                // shaders composite to transparent instead of the terminal
+                // background (the host layer provides the background).
+                // When a background image is active, keep bg_color alpha so
+                // the bg_image shader can composite and opacity-scale it.
+                // The fullscreen background color draw call is still skipped
+                // for layer-background mode when no image is present (see
+                // the draw pass below).
+                if (comptime builtin.os.tag == .macos) {
+                    switch (self.config.background_blur) {
+                        .@"macos-glass-regular",
+                        .@"macos-glass-clear",
+                        => self.uniforms.bg_color[3] = 0,
 
-                    else => {},
-                };
+                        else => {},
+                    }
+                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
+                        self.uniforms.bg_color[3] = 0;
+                }
 
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies
@@ -1413,6 +1623,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            _ = try self.drawFrameWithOptionalPresentation(sync, null);
+        }
+
+        /// Draw a forced frame whose backend presentation carries an opaque
+        /// completion token. A synchronous backend transfers that completion
+        /// to the caller after every renderer cleanup defer has run.
+        pub fn drawFrameWithPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
+            return self.drawFrameWithOptionalPresentation(sync, presentation);
+        }
+
+        fn drawFrameWithOptionalPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: ?renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1448,52 +1677,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) return null;
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
                 self.size.screen.height != surface_size.height;
-
-            // On macOS, CoreAnimation can synchronously request a display during bounds changes.
-            // If we resize our render target and present a freshly cleared surface before the IO
-            // thread delivers the new terminal state/cell buffers, we can show a single-frame
-            // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
-            // last completed frame and let the normal render loop catch up on the next tick.
-            //
-            // Darwin-only: this relies on the display link delivering ASYNC draws that
-            // eventually break the stale-frame replay. On GTK every draw is synchronous
-            // (drawFrame(true) from the render callback), so these early returns latch
-            // permanently after a resize and the surface freezes on its last frame.
-            if (comptime builtin.target.os.tag.isDarwin()) {
-                if (sync and size_changed and self.has_presented.load(.monotonic)) {
-                    try self.api.presentLastTarget();
-                    return;
-                }
-
-                // During resize/layout transitions, the platform can trigger draws before the IO
-                // thread has delivered the corresponding terminal resize (and thus before updateFrame
-                // has rebuilt GPU cell buffers for the new grid). If we draw in that window we can
-                // render nothing but background (visually blank) because the projection/padding math
-                // uses a stale `cells.size` that doesn't match the new screen size.
-                //
-                // Detect this by computing the expected grid for the current surface size and
-                // comparing it to the currently rebuilt cell buffer grid. If they don't match, keep
-                // the last presented frame on-screen until the new cells arrive.
-                if (size_changed) {
-                    const expected_grid = (renderer.Size{
-                        .screen = .{ .width = surface_size.width, .height = surface_size.height },
-                        .cell = self.size.cell,
-                        .padding = self.size.padding,
-                    }).grid();
-
-                    if (expected_grid.columns != self.cells.size.columns or
-                        expected_grid.rows != self.cells.size.rows)
-                    {
-                        try self.api.presentLastTarget();
-                        return;
-                    }
-                }
-            }
 
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
@@ -1508,14 +1696,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
-                return;
+                return null;
             }
-            self.cells_rebuilt = false;
+            var damage = DrawDamageCommit.begin(&self.cells_rebuilt);
+            defer damage.deinit();
 
             // Wait for a frame to be available.
-            const frame = try self.swap_chain.nextFrame();
-            errdefer self.swap_chain.releaseFrame();
-            // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
+            const acquired = try self.swap_chain.nextFrame();
+            const frame = acquired.state;
+            errdefer assert(self.swap_chain.finishFrame(acquired.token, false));
+            // log.debug("drawing frame token={}", .{acquired.token});
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
@@ -1609,8 +1799,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
-            defer frame_ctx.complete(sync);
+            const external_context = if (@hasDecl(GraphicsAPI, "externalFrameContext"))
+                self.api.externalFrameContext()
+            else
+                0;
+            var frame_ctx = try self.api.beginFrame(
+                self,
+                &frame.target,
+                acquired.token,
+                external_context,
+                presentation,
+            );
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -1628,10 +1827,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Otherwise, if we don't have a background image, we
                 // draw the background color by itself in its own step.
                 //
+                // When the host app provides the plain background via a
+                // CALayer (macos_background_from_layer), skip only the
+                // fullscreen color fill — background images still need to
+                // be rendered by Ghostty.
+                //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
+                const skip_bg_fill = if (comptime builtin.os.tag == .macos)
+                    self.config.macos_background_from_layer
+                else
+                    false;
                 if (self.bg_image) |img| switch (img) {
                     .ready => |texture| pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_image,
@@ -1642,12 +1850,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }),
                     else => {},
                 } else {
-                    pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_color,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{ null, frame.cells_bg.buffer },
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    });
+                    if (!skip_bg_fill) {
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.bg_color,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{ null, frame.cells_bg.buffer },
+                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                        });
+                    }
                 }
 
                 // Then we draw any kitty images that need
@@ -1741,32 +1951,71 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+
+            // Arm backend presentation only after every fallible encoding
+            // operation succeeded. Errors above discard the unsubmitted frame
+            // through the swap-chain errdefer and acknowledge no token.
+            const completed_presentation = frame_ctx.complete(sync);
+            damage.commit();
+            return completed_presentation;
         }
 
         // Callback from the graphics API when a frame is completed.
         pub fn frameCompleted(
             self: *Self,
+            target: *Target,
             health: Health,
+            token: renderer.frame_lease.Token,
+            host_acquired: bool,
         ) void {
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
             if (self.health.load(.seq_cst) != health) {
-                self.health.store(health, .seq_cst);
-
-                // Our health value changed, so we notify the surface so that it
-                // can do something about it.
-                _ = self.surface_mailbox.push(.{
+                // cmux iOS fork: this callback runs INLINE on the same serial
+                // dispatch queue that drives `renderNow` (sync=true) and also
+                // owns input/resize/output. A `.forever` push here blocks that
+                // one queue permanently whenever `surface_mailbox` is full —
+                // which happens during a fast pinch-zoom resize storm, where
+                // frames flip health faster than the main-thread app tick
+                // (the mailbox's only drainer) can keep up. Once it wedges,
+                // the tick can never run to drain it, so it never recovers and
+                // the whole terminal freezes.
+                //
+                // Push non-blocking instead and only commit the new health if
+                // it was actually enqueued. A dropped notification is harmless:
+                // the next health change re-fires it (the guard only suppresses
+                // a *stored* value), so health is delivered best-effort without
+                // ever blocking frame recycling.
+                const pushed = self.surface_mailbox.push(.{
                     .renderer_health = health,
-                }, .{ .forever = {} });
+                }, .{ .instant = {} });
+                if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
-            // Always release our semaphore
-            self.swap_chain.releaseFrame();
+            _ = target;
+            // Return this exact slot, or transfer it to the external host.
+            // Completion callbacks are allowed to arrive out of order.
+            assert(self.swap_chain.finishFrame(token, host_acquired));
+        }
 
-            if (health == .healthy) {
-                // Track that we have a last good frame to re-present during sync resize callbacks.
-                self.has_presented.store(true, .monotonic);
-            }
+        /// Mark an exact GPU-complete slot as entering a leased external
+        /// presentation callback. This is thread-safe and intentionally occurs
+        /// before invoking the callback so an immediate cross-process release
+        /// cannot race ownership establishment.
+        pub fn beginExternalFramePresentation(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.beginExternalPresentation(token);
+        }
+
+        /// Release a leased external frame. This may be called from any host
+        /// thread while the surface remains alive.
+        pub fn releaseExternalFrame(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.releaseExternalFrame(token);
         }
 
         /// Call this any time the background image path changes.
@@ -1943,6 +2192,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        /// Update only renderer colors for a manual-IO theme change.
+        pub fn changeColorConfig(self: *Self, config: *const configpkg.Config) void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
+            self.config.cursor_color = config.@"cursor-color";
+            self.config.cursor_text = config.@"cursor-text";
+            self.config.background = config.background.toTerminalRGB();
+            self.config.foreground = config.foreground.toTerminalRGB();
+            self.config.selection_background = config.@"selection-background";
+            self.config.selection_foreground = config.@"selection-foreground";
+            self.config.bold_color = if (config.@"bold-color") |color| color.toTerminal() else null;
+            self.markDirty();
+        }
+
         /// Resize the screen.
         pub fn setScreenSize(
             self: *Self,
@@ -2042,11 +2306,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Only update when terminal state is dirty.
             if (self.terminal_state.dirty == .false) return;
 
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
             const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
 
             // 256-color palette
             for (colors.palette, 0..) |color, i| {
-                self.custom_shader_uniforms.palette[i] = .{
+                uniforms.palette[i] = .{
                     @as(f32, @floatFromInt(color.r)) / 255.0,
                     @as(f32, @floatFromInt(color.g)) / 255.0,
                     @as(f32, @floatFromInt(color.b)) / 255.0,
@@ -2055,7 +2320,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Background color
-            self.custom_shader_uniforms.background_color = .{
+            uniforms.background_color = .{
                 @as(f32, @floatFromInt(colors.background.r)) / 255.0,
                 @as(f32, @floatFromInt(colors.background.g)) / 255.0,
                 @as(f32, @floatFromInt(colors.background.b)) / 255.0,
@@ -2063,7 +2328,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             // Foreground color
-            self.custom_shader_uniforms.foreground_color = .{
+            uniforms.foreground_color = .{
                 @as(f32, @floatFromInt(colors.foreground.r)) / 255.0,
                 @as(f32, @floatFromInt(colors.foreground.g)) / 255.0,
                 @as(f32, @floatFromInt(colors.foreground.b)) / 255.0,
@@ -2072,7 +2337,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Cursor color
             if (colors.cursor) |cursor_color| {
-                self.custom_shader_uniforms.cursor_color = .{
+                uniforms.cursor_color = .{
                     @as(f32, @floatFromInt(cursor_color.r)) / 255.0,
                     @as(f32, @floatFromInt(cursor_color.g)) / 255.0,
                     @as(f32, @floatFromInt(cursor_color.b)) / 255.0,
@@ -2086,7 +2351,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Cursor text color
             if (self.config.cursor_text) |cursor_text| {
-                self.custom_shader_uniforms.cursor_text = .{
+                uniforms.cursor_text = .{
                     @as(f32, @floatFromInt(cursor_text.color.r)) / 255.0,
                     @as(f32, @floatFromInt(cursor_text.color.g)) / 255.0,
                     @as(f32, @floatFromInt(cursor_text.color.b)) / 255.0,
@@ -2096,7 +2361,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Selection background color
             if (self.config.selection_background) |selection_bg| {
-                self.custom_shader_uniforms.selection_background_color = .{
+                uniforms.selection_background_color = .{
                     @as(f32, @floatFromInt(selection_bg.color.r)) / 255.0,
                     @as(f32, @floatFromInt(selection_bg.color.g)) / 255.0,
                     @as(f32, @floatFromInt(selection_bg.color.b)) / 255.0,
@@ -2106,13 +2371,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Selection foreground color
             if (self.config.selection_foreground) |selection_fg| {
-                self.custom_shader_uniforms.selection_foreground_color = .{
+                uniforms.selection_foreground_color = .{
                     @as(f32, @floatFromInt(selection_fg.color.r)) / 255.0,
                     @as(f32, @floatFromInt(selection_fg.color.g)) / 255.0,
                     @as(f32, @floatFromInt(selection_fg.color.b)) / 255.0,
                     1.0,
                 };
             }
+
+            // Cursor visibility
+            uniforms.cursor_visible = @intFromBool(self.terminal_state.cursor.visible);
+
+            // Cursor style
+            const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
+            uniforms.previous_cursor_style = uniforms.current_cursor_style;
+            uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
 
         /// Update per-frame custom shader uniforms.
@@ -2122,7 +2395,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // We only need to do this if we have custom shaders.
             if (!self.has_custom_shaders) return;
 
-            const uniforms = &self.custom_shader_uniforms;
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
 
             const now = try std.time.Instant.now();
             defer self.last_frame_time = now;
@@ -2156,7 +2429,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 0,
             };
 
-            // Update custom cursor uniforms, if we have a cursor.
             if (self.cells.getCursorGlyph()) |cursor| {
                 const cursor_width: f32 = @floatFromInt(cursor.glyph_size[0]);
                 const cursor_height: f32 = @floatFromInt(cursor.glyph_size[1]);
@@ -2756,10 +3028,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Advance our index until we reach or pass
                     // our current x position in the shaper cells.
-                    const shaper_cells_unwrapped = shaper_cells.?;
-                    while (run.offset + shaper_cells_unwrapped[shaper_cells_i].x < x) {
-                        shaper_cells_i += 1;
-                    }
+                    advanceShaperCellIndexToX(
+                        run.offset,
+                        shaper_cells.?,
+                        &shaper_cells_i,
+                        x,
+                    );
                 }
 
                 const wide = cell.wide;
@@ -3391,4 +3665,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+test "renderer rebuild row preedit catch-up tolerates empty tail after covered glyph" {
+    const testing = std.testing;
+
+    const shaped_cells = [_]font.shape.Cell{
+        .{ .x = 0, .glyph_index = 1 },
+    };
+    var shaper_cells_i: usize = 0;
+
+    advanceShaperCellIndexToX(
+        0,
+        &shaped_cells,
+        &shaper_cells_i,
+        1,
+    );
+
+    try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
+}
+
+test "prepared frame damage remains retryable until draw commit" {
+    var cells_rebuilt = true;
+    {
+        var damage = DrawDamageCommit.begin(&cells_rebuilt);
+        defer damage.deinit();
+
+        // Leaving the scope without a commit models any fallible draw stage.
+    }
+    try std.testing.expect(cells_rebuilt);
+
+    {
+        var damage = DrawDamageCommit.begin(&cells_rebuilt);
+        defer damage.deinit();
+        damage.commit();
+    }
+    try std.testing.expect(!cells_rebuilt);
 }

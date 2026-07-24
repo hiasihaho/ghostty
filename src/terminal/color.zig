@@ -47,6 +47,98 @@ pub const default: Palette = default: {
 /// Palette is the 256 color palette.
 pub const Palette = [256]RGB;
 
+/// A parsed palette entry from Ghostty's config "N=COLOR" syntax.
+pub const PaletteEntry = struct {
+    index: u8,
+    color: RGB,
+};
+
+/// Parse a palette entry in Ghostty config syntax: "N=COLOR" where N is
+/// a palette index 0-255 (decimal, or 0x/0o/0b-prefixed per Zig's
+/// parseInt base-0 rules) and COLOR is anything RGB.parse accepts.
+/// Whitespace (spaces/tabs) around N and COLOR is ignored.
+pub fn parsePaletteEntry(value: []const u8) error{ InvalidFormat, Overflow }!PaletteEntry {
+    const eql_idx = std.mem.indexOfScalar(u8, value, '=') orelse
+        return error.InvalidFormat;
+    const index = std.fmt.parseInt(
+        u8,
+        std.mem.trim(u8, value[0..eql_idx], " \t"),
+        0,
+    ) catch |err| switch (err) {
+        error.Overflow => return error.Overflow,
+        error.InvalidCharacter => return error.InvalidFormat,
+    };
+    const rgb = try RGB.parse(value[eql_idx + 1 ..]);
+    return .{ .index = index, .color = rgb };
+}
+
+test "parsePaletteEntry" {
+    const testing = std.testing;
+
+    {
+        const entry = try parsePaletteEntry("0=#AABBCC");
+        try testing.expectEqual(@as(u8, 0), entry.index);
+        try testing.expectEqual(RGB{ .r = 170, .g = 187, .b = 204 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry("0b1=#014589");
+        try testing.expectEqual(@as(u8, 1), entry.index);
+        try testing.expectEqual(RGB{ .r = 1, .g = 69, .b = 137 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry("0o7=#234567");
+        try testing.expectEqual(@as(u8, 7), entry.index);
+        try testing.expectEqual(RGB{ .r = 35, .g = 69, .b = 103 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry("0xF=#ABCDEF");
+        try testing.expectEqual(@as(u8, 15), entry.index);
+        try testing.expectEqual(RGB{ .r = 171, .g = 205, .b = 239 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry("0 =  #AABBCC");
+        try testing.expectEqual(@as(u8, 0), entry.index);
+        try testing.expectEqual(RGB{ .r = 170, .g = 187, .b = 204 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry(" 1= #DDEEFF    ");
+        try testing.expectEqual(@as(u8, 1), entry.index);
+        try testing.expectEqual(RGB{ .r = 221, .g = 238, .b = 255 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry("  2  =  #123456 ");
+        try testing.expectEqual(@as(u8, 2), entry.index);
+        try testing.expectEqual(RGB{ .r = 18, .g = 52, .b = 86 }, entry.color);
+    }
+    {
+        const entry = try parsePaletteEntry("1=black");
+        try testing.expectEqual(@as(u8, 1), entry.index);
+        try testing.expectEqual(RGB{ .r = 0, .g = 0, .b = 0 }, entry.color);
+    }
+
+    try testing.expectError(error.InvalidFormat, parsePaletteEntry(" "));
+    try testing.expectError(error.InvalidFormat, parsePaletteEntry("a"));
+    try testing.expectError(error.Overflow, parsePaletteEntry("256=#AABBCC"));
+    try testing.expectError(error.InvalidFormat, parsePaletteEntry("1=notacolor"));
+}
+
+/// C-compatible palette type using the extern RGB struct.
+pub const PaletteC = [256]RGB.C;
+
+/// Convert a Palette to a PaletteC.
+pub fn paletteCval(palette: *const Palette) PaletteC {
+    var result: PaletteC = undefined;
+    for (&result, palette) |*dst, src| dst.* = src.cval();
+    return result;
+}
+
+/// Convert a PaletteC to a Palette.
+pub fn paletteZval(palette: *const PaletteC) Palette {
+    var result: Palette = undefined;
+    for (&result, palette) |*dst, src| dst.* = .fromC(src);
+    return result;
+}
+
 /// Mask that can be used to set which palette indexes were set.
 pub const PaletteMask = std.StaticBitSet(@typeInfo(Palette).array.len);
 
@@ -90,14 +182,31 @@ pub fn generate256Color(
     skip: PaletteMask,
     bg: RGB,
     fg: RGB,
+    harmonious: bool,
 ) Palette {
     // Convert the background, foreground, and 8 base theme colors into
     // CIELAB space so that all interpolation is perceptually uniform.
-    const bg_lab: LAB = .fromRgb(bg);
-    const fg_lab: LAB = .fromRgb(fg);
     const base8_lab: [8]LAB = base8: {
-        var base8: [8]LAB = undefined;
-        for (0..8) |i| base8[i] = .fromRgb(base[i]);
+        var base8: [8]LAB = .{
+            .fromRgb(bg),
+            LAB.fromRgb(base[1]),
+            LAB.fromRgb(base[2]),
+            LAB.fromRgb(base[3]),
+            LAB.fromRgb(base[4]),
+            LAB.fromRgb(base[5]),
+            LAB.fromRgb(base[6]),
+            .fromRgb(fg),
+        };
+
+        // For light themes (where the foreground is darker than the
+        // background), the cube's dark-to-light orientation is inverted
+        // relative to the base color mapping. When `harmonious` is false,
+        // swap bg and fg so the cube still runs from black (16) to
+        // white (231).
+        const is_light_theme = base8[7].l < base8[0].l;
+        const invert = is_light_theme and !harmonious;
+        if (invert) std.mem.swap(LAB, &base8[0], &base8[7]);
+
         break :base8 base8;
     };
 
@@ -115,10 +224,10 @@ pub fn generate256Color(
     for (0..6) |ri| {
         // R-axis corners: blend base colors along the red dimension.
         const tr = @as(f32, @floatFromInt(ri)) / 5.0;
-        const c0: LAB = .lerp(tr, bg_lab, base8_lab[1]);
+        const c0: LAB = .lerp(tr, base8_lab[0], base8_lab[1]);
         const c1: LAB = .lerp(tr, base8_lab[2], base8_lab[3]);
         const c2: LAB = .lerp(tr, base8_lab[4], base8_lab[5]);
-        const c3: LAB = .lerp(tr, base8_lab[6], fg_lab);
+        const c3: LAB = .lerp(tr, base8_lab[6], base8_lab[7]);
         for (0..6) |gi| {
             // G-axis edges: blend the R-interpolated corners along green.
             const tg = @as(f32, @floatFromInt(gi)) / 5.0;
@@ -147,7 +256,7 @@ pub fn generate256Color(
     for (0..24) |i| {
         const t = @as(f32, @floatFromInt(i + 1)) / 25.0;
         if (!skip.isSet(idx)) {
-            const c: LAB = .lerp(t, bg_lab, fg_lab);
+            const c: LAB = .lerp(t, base8_lab[0], base8_lab[7]);
             result[idx] = c.toRgb();
         }
         idx += 1;
@@ -241,7 +350,7 @@ pub const DynamicRGB = struct {
     }
 
     pub fn reset(self: *DynamicRGB) void {
-        self.override = self.default;
+        self.override = null;
     }
 };
 
@@ -391,6 +500,10 @@ pub const RGB = packed struct(u24) {
         b: u8,
     };
 
+    pub fn fromC(c: C) RGB {
+        return .{ .r = c.r, .g = c.g, .b = c.b };
+    }
+
     pub fn cval(self: RGB) C {
         return .{
             .r = self.r,
@@ -401,6 +514,24 @@ pub const RGB = packed struct(u24) {
 
     pub fn eql(self: RGB, other: RGB) bool {
         return self.r == other.r and self.g == other.g and self.b == other.b;
+    }
+
+    pub fn encodeRgb8(self: RGB, writer: *std.Io.Writer) !void {
+        try writer.print(
+            "rgb:{x:0>2}/{x:0>2}/{x:0>2}",
+            .{ self.r, self.g, self.b },
+        );
+    }
+
+    pub fn encodeRgb16(self: RGB, writer: *std.Io.Writer) !void {
+        try writer.print(
+            "rgb:{x:0>4}/{x:0>4}/{x:0>4}",
+            .{
+                @as(u16, self.r) * 257,
+                @as(u16, self.g) * 257,
+                @as(u16, self.b) * 257,
+            },
+        );
     }
 
     /// Calculates the contrast ratio between two colors. The contrast
@@ -503,6 +634,8 @@ pub const RGB = packed struct(u24) {
 
     /// Parse a color specification.
     ///
+    /// Leading and trailing spaces and tabs are ignored.
+    ///
     /// Any of the following forms are accepted:
     ///
     /// 1. rgb:<red>/<green>/<blue>
@@ -516,38 +649,42 @@ pub const RGB = packed struct(u24) {
     ///    where <red>, <green>, and <blue> are floating point values between
     ///    0.0 and 1.0 (inclusive).
     ///
-    /// 3. #rgb, #rrggbb, #rrrgggbbb #rrrrggggbbbb
+    /// 3. #rgb, #rrggbb, rgb, rrggbb, #rrrgggbbb, #rrrrggggbbbb
     ///
-    ///    where `r`, `g`, and `b` are a single hexadecimal digit.
-    ///    These specify a color with 4, 8, 12, and 16 bits of precision
-    ///    per color channel.
+    ///    where `r`, `g`, and `b` are hexadecimal digits. The forms with
+    ///    a leading # specify a color with 4, 8, 12, and 16 bits of
+    ///    precision per color channel. The forms without a leading # are
+    ///    accepted for compatibility with Ghostty config/theme color values.
+    ///
+    /// 4. X11 color names
     pub fn parse(value: []const u8) error{InvalidFormat}!RGB {
-        if (value.len == 0) {
+        const input = std.mem.trim(u8, value, " \t");
+        if (input.len == 0) {
             @branchHint(.cold);
             return error.InvalidFormat;
         }
 
-        if (value[0] == '#') {
-            switch (value.len) {
+        if (input[0] == '#') {
+            switch (input.len) {
                 4 => return RGB{
-                    .r = try RGB.fromHex(value[1..2]),
-                    .g = try RGB.fromHex(value[2..3]),
-                    .b = try RGB.fromHex(value[3..4]),
+                    .r = try RGB.fromHex(input[1..2]),
+                    .g = try RGB.fromHex(input[2..3]),
+                    .b = try RGB.fromHex(input[3..4]),
                 },
                 7 => return RGB{
-                    .r = try RGB.fromHex(value[1..3]),
-                    .g = try RGB.fromHex(value[3..5]),
-                    .b = try RGB.fromHex(value[5..7]),
+                    .r = try RGB.fromHex(input[1..3]),
+                    .g = try RGB.fromHex(input[3..5]),
+                    .b = try RGB.fromHex(input[5..7]),
                 },
                 10 => return RGB{
-                    .r = try RGB.fromHex(value[1..4]),
-                    .g = try RGB.fromHex(value[4..7]),
-                    .b = try RGB.fromHex(value[7..10]),
+                    .r = try RGB.fromHex(input[1..4]),
+                    .g = try RGB.fromHex(input[4..7]),
+                    .b = try RGB.fromHex(input[7..10]),
                 },
                 13 => return RGB{
-                    .r = try RGB.fromHex(value[1..5]),
-                    .g = try RGB.fromHex(value[5..9]),
-                    .b = try RGB.fromHex(value[9..13]),
+                    .r = try RGB.fromHex(input[1..5]),
+                    .g = try RGB.fromHex(input[5..9]),
+                    .b = try RGB.fromHex(input[9..13]),
                 },
 
                 else => {
@@ -557,24 +694,36 @@ pub const RGB = packed struct(u24) {
             }
         }
 
-        // Check for X11 named colors. We allow whitespace around the edges
-        // of the color because Kitty allows whitespace. This is not part of
-        // any spec I could find.
-        if (x11_color.map.get(std.mem.trim(u8, value, " "))) |rgb| return rgb;
+        // Check for X11 named colors. We allow whitespace around the edges.
+        if (x11_color.map.get(input)) |rgb| return rgb;
 
-        if (value.len < "rgb:a/a/a".len or !std.mem.eql(u8, value[0..3], "rgb")) {
+        switch (input.len) {
+            3 => return RGB{
+                .r = try RGB.fromHex(input[0..1]),
+                .g = try RGB.fromHex(input[1..2]),
+                .b = try RGB.fromHex(input[2..3]),
+            },
+            6 => return RGB{
+                .r = try RGB.fromHex(input[0..2]),
+                .g = try RGB.fromHex(input[2..4]),
+                .b = try RGB.fromHex(input[4..6]),
+            },
+            else => {},
+        }
+
+        if (input.len < "rgb:a/a/a".len or !std.mem.eql(u8, input[0..3], "rgb")) {
             @branchHint(.cold);
             return error.InvalidFormat;
         }
 
         var i: usize = 3;
 
-        const use_intensity = if (value[i] == 'i') blk: {
+        const use_intensity = if (input[i] == 'i') blk: {
             i += 1;
             break :blk true;
         } else false;
 
-        if (value[i] != ':') {
+        if (input[i] != ':') {
             @branchHint(.cold);
             return error.InvalidFormat;
         }
@@ -582,8 +731,8 @@ pub const RGB = packed struct(u24) {
         i += 1;
 
         const r = r: {
-            const slice = if (std.mem.indexOfScalarPos(u8, value, i, '/')) |end|
-                value[i..end]
+            const slice = if (std.mem.indexOfScalarPos(u8, input, i, '/')) |end|
+                input[i..end]
             else {
                 @branchHint(.cold);
                 return error.InvalidFormat;
@@ -598,8 +747,8 @@ pub const RGB = packed struct(u24) {
         };
 
         const g = g: {
-            const slice = if (std.mem.indexOfScalarPos(u8, value, i, '/')) |end|
-                value[i..end]
+            const slice = if (std.mem.indexOfScalarPos(u8, input, i, '/')) |end|
+                input[i..end]
             else {
                 @branchHint(.cold);
                 return error.InvalidFormat;
@@ -614,9 +763,9 @@ pub const RGB = packed struct(u24) {
         };
 
         const b = if (use_intensity)
-            try RGB.fromIntensity(value[i..])
+            try RGB.fromIntensity(input[i..])
         else
-            try RGB.fromHex(value[i..]);
+            try RGB.fromHex(input[i..]);
 
         return RGB{
             .r = r,
@@ -742,6 +891,11 @@ test "RGB.parse" {
     try testing.expectEqual(RGB{ .r = 255, .g = 255, .b = 255 }, try RGB.parse("#fffffffff"));
     try testing.expectEqual(RGB{ .r = 255, .g = 255, .b = 255 }, try RGB.parse("#ffffffffffff"));
     try testing.expectEqual(RGB{ .r = 255, .g = 0, .b = 16 }, try RGB.parse("#ff0010"));
+    try testing.expectEqual(RGB{ .r = 10, .g = 11, .b = 12 }, try RGB.parse("0A0B0C"));
+    try testing.expectEqual(RGB{ .r = 255, .g = 255, .b = 255 }, try RGB.parse("FFFFFF"));
+    try testing.expectEqual(RGB{ .r = 255, .g = 255, .b = 255 }, try RGB.parse("FFF"));
+    try testing.expectEqual(RGB{ .r = 51, .g = 68, .b = 85 }, try RGB.parse("#345"));
+    try testing.expectEqual(RGB{ .r = 170, .g = 187, .b = 204 }, try RGB.parse(" #AABBCC   "));
 
     try testing.expectEqual(RGB{ .r = 0, .g = 0, .b = 0 }, try RGB.parse("black"));
     try testing.expectEqual(RGB{ .r = 255, .g = 0, .b = 0 }, try RGB.parse("red"));
@@ -752,8 +906,11 @@ test "RGB.parse" {
     try testing.expectEqual(RGB{ .r = 124, .g = 252, .b = 0 }, try RGB.parse("LawnGreen"));
     try testing.expectEqual(RGB{ .r = 0, .g = 250, .b = 154 }, try RGB.parse("medium spring green"));
     try testing.expectEqual(RGB{ .r = 34, .g = 139, .b = 34 }, try RGB.parse(" Forest Green "));
+    try testing.expectEqual(RGB{ .r = 34, .g = 139, .b = 34 }, try RGB.parse("\tForestGreen\t"));
 
     // Invalid format
+    try testing.expectError(error.InvalidFormat, RGB.parse(""));
+    try testing.expectError(error.InvalidFormat, RGB.parse("  "));
     try testing.expectError(error.InvalidFormat, RGB.parse("rgb;"));
     try testing.expectError(error.InvalidFormat, RGB.parse("rgb:"));
     try testing.expectError(error.InvalidFormat, RGB.parse(":a/a/a"));
@@ -769,6 +926,22 @@ test "RGB.parse" {
     try testing.expectError(error.InvalidFormat, RGB.parse("#ffff"));
     try testing.expectError(error.InvalidFormat, RGB.parse("#fffff"));
     try testing.expectError(error.InvalidFormat, RGB.parse("#gggggg"));
+    try testing.expectError(error.InvalidFormat, RGB.parse("#12345"));
+    try testing.expectError(error.InvalidFormat, RGB.parse("12345"));
+    try testing.expectError(error.InvalidFormat, RGB.parse("nosuchcolor"));
+}
+
+test "RGB: encode" {
+    const rgb: RGB = .{ .r = 0x01, .g = 0x23, .b = 0xff };
+
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try rgb.encodeRgb8(&writer);
+    try std.testing.expectEqualStrings("rgb:01/23/ff", writer.buffered());
+
+    writer = .fixed(&buf);
+    try rgb.encodeRgb16(&writer);
+    try std.testing.expectEqualStrings("rgb:0101/2323/ffff", writer.buffered());
 }
 
 test "DynamicPalette: init" {
@@ -926,7 +1099,7 @@ test "generate256Color: base16 preserved" {
 
     const bg = RGB{ .r = 0, .g = 0, .b = 0 };
     const fg = RGB{ .r = 255, .g = 255, .b = 255 };
-    const palette = generate256Color(default, .initEmpty(), bg, fg);
+    const palette = generate256Color(default, .initEmpty(), bg, fg, false);
 
     // The first 16 colors (base16) must remain unchanged.
     for (0..16) |i| {
@@ -939,7 +1112,7 @@ test "generate256Color: cube corners match base colors" {
 
     const bg = RGB{ .r = 0, .g = 0, .b = 0 };
     const fg = RGB{ .r = 255, .g = 255, .b = 255 };
-    const palette = generate256Color(default, .initEmpty(), bg, fg);
+    const palette = generate256Color(default, .initEmpty(), bg, fg, false);
 
     // Index 16 is cube (0,0,0) which should equal bg.
     try testing.expectEqual(bg, palette[16]);
@@ -948,12 +1121,43 @@ test "generate256Color: cube corners match base colors" {
     try testing.expectEqual(fg, palette[231]);
 }
 
+test "generate256Color: cube corners black/white with harmonious=false" {
+    const testing = std.testing;
+
+    const black = RGB{ .r = 0, .g = 0, .b = 0 };
+    const white = RGB{ .r = 255, .g = 255, .b = 255 };
+
+    // Dark theme: bg=black, fg=white.
+    const dark = generate256Color(default, .initEmpty(), black, white, false);
+    try testing.expectEqual(black, dark[16]);
+    try testing.expectEqual(white, dark[231]);
+
+    // Light theme: bg=white, fg=black. The bg/red swap ensures
+    // the cube still runs from black (16) to white (231).
+    const light = generate256Color(default, .initEmpty(), white, black, false);
+    try testing.expectEqual(black, light[16]);
+    try testing.expectEqual(white, light[231]);
+}
+
+test "generate256Color: light theme cube corners with harmonious=true" {
+    const testing = std.testing;
+
+    const white = RGB{ .r = 255, .g = 255, .b = 255 };
+    const black = RGB{ .r = 0, .g = 0, .b = 0 };
+
+    // harmonious=true skips the bg/fg swap, so the cube preserves the
+    // original orientation: (0,0,0)=bg=white, (5,5,5)=fg=black.
+    const palette = generate256Color(default, .initEmpty(), white, black, true);
+    try testing.expectEqual(white, palette[16]);
+    try testing.expectEqual(black, palette[231]);
+}
+
 test "generate256Color: grayscale ramp monotonic luminance" {
     const testing = std.testing;
 
     const bg = RGB{ .r = 0, .g = 0, .b = 0 };
     const fg = RGB{ .r = 255, .g = 255, .b = 255 };
-    const palette = generate256Color(default, .initEmpty(), bg, fg);
+    const palette = generate256Color(default, .initEmpty(), bg, fg, false);
 
     // The grayscale ramp (232–255) should have monotonically increasing
     // luminance from near-black to near-white.
@@ -977,13 +1181,80 @@ test "generate256Color: skip mask preserves original colors" {
     skip.set(100);
     skip.set(240);
 
-    const palette = generate256Color(default, skip, bg, fg);
+    const palette = generate256Color(default, skip, bg, fg, false);
     try testing.expectEqual(default[20], palette[20]);
     try testing.expectEqual(default[100], palette[100]);
     try testing.expectEqual(default[240], palette[240]);
 
     // A non-skipped index in the cube should differ from the default.
     try testing.expect(!palette[21].eql(default[21]));
+}
+
+test "generate256Color: dark theme harmonious has no effect" {
+    const testing = std.testing;
+
+    // For a dark theme (fg lighter than bg), harmonious should not change
+    // the output because the inversion is only relevant for light themes.
+    const bg = RGB{ .r = 0, .g = 0, .b = 0 };
+    const fg = RGB{ .r = 255, .g = 255, .b = 255 };
+    const normal = generate256Color(default, .initEmpty(), bg, fg, false);
+    const harmonious = generate256Color(default, .initEmpty(), bg, fg, true);
+
+    for (16..256) |i| {
+        try testing.expectEqual(normal[i], harmonious[i]);
+    }
+}
+
+test "generate256Color: light theme harmonious skips inversion" {
+    const testing = std.testing;
+
+    // For a light theme (fg darker than bg), harmonious=true skips the
+    // bg/red swap, producing different cube colors than harmonious=false.
+    const bg = RGB{ .r = 255, .g = 255, .b = 255 };
+    const fg = RGB{ .r = 0, .g = 0, .b = 0 };
+    const inverted = generate256Color(default, .initEmpty(), bg, fg, false);
+    const harmonious = generate256Color(default, .initEmpty(), bg, fg, true);
+
+    // Cube origin (0,0,0) at index 16: without harmonious, bg and red are
+    // swapped so it becomes the red base; with harmonious it stays as bg.
+    try testing.expectEqual(bg, harmonious[16]);
+    try testing.expect(!inverted[16].eql(bg));
+
+    // At least some cube colors should differ between the two modes.
+    var differ: usize = 0;
+    for (16..232) |i| {
+        if (!inverted[i].eql(harmonious[i])) differ += 1;
+    }
+    try testing.expect(differ > 0);
+}
+
+test "generate256Color: light theme harmonious grayscale ramp" {
+    const testing = std.testing;
+
+    const bg = RGB{ .r = 255, .g = 255, .b = 255 };
+    const fg = RGB{ .r = 0, .g = 0, .b = 0 };
+
+    // harmonious=false swaps bg/fg, so the ramp runs black→white (increasing).
+    {
+        const palette = generate256Color(default, .initEmpty(), bg, fg, false);
+        var prev_lum: f64 = 0.0;
+        for (232..256) |i| {
+            const lum = palette[i].luminance();
+            try testing.expect(lum >= prev_lum);
+            prev_lum = lum;
+        }
+    }
+
+    // harmonious=true keeps original order, so the ramp runs white→black (decreasing).
+    {
+        const palette = generate256Color(default, .initEmpty(), bg, fg, true);
+        var prev_lum: f64 = 1.0;
+        for (232..256) |i| {
+            const lum = palette[i].luminance();
+            try testing.expect(lum <= prev_lum);
+            prev_lum = lum;
+        }
+    }
 }
 
 test "LAB.toRgb" {

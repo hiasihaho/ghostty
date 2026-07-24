@@ -67,6 +67,14 @@ sudo xcode-select --switch /Applications/Xcode.app
 > You do not need to be running on macOS 26 to build Ghostty, you can
 > still use Xcode 26 on macOS 15 stable.
 
+> [!WARNING]
+>
+> Zig 0.15.x has a [known linking issue](https://codeberg.org/ziglang/zig/issues/31658)
+> with **Xcode 26.4**. If you are on Xcode 26.4, you must use a
+> Homebrew-installed Zig (`brew install zig@0.15`) or our Nix flake,
+> both of which contain a patch that works around the issue. Alternatively,
+> you can downgrade to **Xcode 26.3**.
+
 ## AI and Agents
 
 If you're using AI assistance with Ghostty, Ghostty provides an
@@ -184,6 +192,31 @@ shellcheck \
     --check-sourced \
     --severity=warning \
     $(find . \( -name "*.sh" -o -name "*.bash" \) -type f ! -path "./zig-out/*" ! -path "./macos/build/*" ! -path "./.git/*" | sort)
+```
+
+### SwiftLint
+
+Swift code is linted using [SwiftLint](https://github.com/realm/SwiftLint). A
+SwiftLint CI check will fail builds with improper formatting. Therefore, if you
+are modifying Swift code, you may want to install it locally and run this from
+the repo root before you commit:
+
+```
+swiftlint lint --fix
+```
+
+Make sure your SwiftLint version matches the version in [devShell.nix](https://github.com/ghostty-org/ghostty/blob/main/nix/devShell.nix).
+
+Nix users can use the following command to format with SwiftLint:
+
+```
+nix develop -c swiftlint lint --fix
+```
+
+To check for violations without auto-fixing:
+
+```
+nix develop -c swiftlint lint --strict
 ```
 
 ### Updating the Zig Cache Fixed-Output Derivation Hash

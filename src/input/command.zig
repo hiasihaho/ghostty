@@ -339,6 +339,10 @@ fn actionCommands(action: Action.Key) []const Command {
             },
         },
 
+        // No command palette entries; this is invoked programmatically by
+        // the cmux mobile snapshot path.
+        .write_active_file => comptime &.{},
+
         .write_selection_file => comptime &.{
             .{
                 .action = .{ .write_selection_file = .copy },
@@ -440,13 +444,13 @@ fn actionCommands(action: Action.Key) []const Command {
 
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
-            .title = "Change Terminal Title...",
+            .title = "Change Terminal Title…",
             .description = "Prompt for a new title for the current terminal.",
         }},
 
         .prompt_tab_title => comptime &.{.{
             .action = .prompt_tab_title,
-            .title = "Change Tab Title...",
+            .title = "Change Tab Title…",
             .description = "Prompt for a new title for the current tab.",
         }},
 
@@ -689,6 +693,8 @@ fn actionCommands(action: Action.Key) []const Command {
         .esc,
         .cursor_key,
         .set_font_size,
+        .set_surface_title,
+        .set_tab_title,
         .search,
         .scroll_to_row,
         .scroll_page_fractional,

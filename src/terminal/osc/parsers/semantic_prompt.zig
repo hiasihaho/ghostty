@@ -1,7 +1,9 @@
 //! https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
 const std = @import("std");
+
 const Parser = @import("../../osc.zig").Parser;
 const OSCCommand = @import("../../osc.zig").Command;
+const string_encoding = @import("../../../os/string_encoding.zig");
 
 const log = std.log.scoped(.osc_semantic_prompt);
 
@@ -12,6 +14,8 @@ const log = std.log.scoped(.osc_semantic_prompt);
 /// all except one do and the spec does also say to ignore unknown
 /// options. So, I think this is a fair interpretation.
 pub const Command = struct {
+    pub const C = void;
+
     action: Action,
     options_unvalidated: []const u8,
 
@@ -40,13 +44,39 @@ pub const Command = struct {
     ) ?option.Type() {
         return option.read(self.options_unvalidated);
     }
+
+    /// Write the decoded command line (if any) to the writer. If an error
+    /// occurs garbage may have been written to the writer.
+    pub fn writeCommandLine(self: Command, writer: *std.Io.Writer) (std.Io.Writer.Error || error{DecodeError})!void {
+        if (self.readOption(.cmdline)) |command_line| {
+            try string_encoding.printfQDecode(writer, command_line);
+            return;
+        }
+        if (self.readOption(.cmdline_url)) |command_line| {
+            try string_encoding.urlPercentDecode(writer, command_line);
+            return;
+        }
+        return;
+    }
 };
+
+// ClickEvents can either be a click_events=1 or click_events=2.
+// The click_events=1 sends a click event with the absolute coordinates
+// of the click.
+// The click_events=2 sends a click event with the coordinates of the click
+// relative to the prompt area.
+// See https://github.com/ghostty-org/ghostty/issues/10865 and
+// https://github.com/kovidgoyal/kitty/issues/9500
+// for further details.
+pub const ClickEvents = enum { absolute, relative };
 
 pub const Option = enum {
     aid,
     cl,
     prompt_kind,
     err,
+    cmdline,
+    cmdline_url,
 
     // https://sw.kovidgoyal.net/kitty/shell-integration/#notes-for-shell-developers
     // Kitty supports a "redraw" option for prompt_start. This is extended
@@ -82,7 +112,9 @@ pub const Option = enum {
             .err => []const u8,
             .redraw => Redraw,
             .special_key => bool,
-            .click_events => bool,
+            .click_events => ClickEvents,
+            .cmdline => []const u8,
+            .cmdline_url => []const u8,
             .exit_code => i32,
         };
     }
@@ -96,6 +128,8 @@ pub const Option = enum {
             .redraw => "redraw",
             .special_key => "special_key",
             .click_events => "click_events",
+            .cmdline => "cmdline",
+            .cmdline_url => "cmdline_url",
 
             // special case, handled before ever calling key
             .exit_code => unreachable,
@@ -176,11 +210,18 @@ pub const Option = enum {
                     .last
                 else
                     null,
-                .special_key, .click_events => if (value.len == 1) switch (value[0]) {
+                .click_events => if (value.len == 1) switch (value[0]) {
+                    '1' => .absolute,
+                    '2' => .relative,
+                    else => null,
+                } else null,
+                .special_key => if (value.len == 1) switch (value[0]) {
                     '0' => false,
                     '1' => true,
                     else => null,
                 } else null,
+                .cmdline => value,
+                .cmdline_url => value,
                 // Handled above
                 .exit_code => unreachable,
             };
@@ -272,11 +313,11 @@ pub const Redraw = enum(u2) {
 
 /// Parse OSC 133, semantic prompts
 pub fn parse(parser: *Parser, _: ?u8) ?*OSCCommand {
-    const writer = parser.writer orelse {
+    const cap = if (parser.capture) |*c| c else {
         parser.state = .invalid;
         return null;
     };
-    const data = writer.buffered();
+    const data = cap.trailing();
     if (data.len == 0) {
         parser.state = .invalid;
         return null;
@@ -387,6 +428,280 @@ test "OSC 133: end_input_start_output with options" {
     try testing.expect(cmd == .semantic_prompt);
     try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
     try testing.expectEqualStrings("foo", cmd.semantic_prompt.readOption(.aid).?);
+}
+
+test "OSC 133: end_input_start_output with cmdline" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline=echo bobr kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr kurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline 3" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline=echo bobr\\nkurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr\nkurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline 4" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline=$'echo bobr kurwa'";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr kurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline 5" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline='echo bobr kurwa'";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr kurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline 6" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline='echo bobr kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
+}
+
+test "OSC 133: end_input_start_output with cmdline 7" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline=$'echo bobr kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
+}
+
+test "OSC 133: end_input_start_output with cmdline 8" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline=$'";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
+}
+
+test "OSC 133: end_input_start_output with cmdline 9" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline=";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 1" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr kurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 2" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr%20kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr kurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 3" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr%3bkurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr;kurwa", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 4" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr%3kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 5" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr%kurwa";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 6" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr kurwa%20";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+
+    try cmd.semantic_prompt.writeCommandLine(&w.writer);
+    try testing.expectEqualStrings("echo bobr kurwa ", w.written());
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 7" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr kurwa%2";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
+}
+
+test "OSC 133: end_input_start_output with cmdline_url 8" {
+    const testing = std.testing;
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+
+    var p: Parser = .init(null);
+    const input = "133;C;cmdline_url=echo bobr kurwa%";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .end_input_start_output);
+    try testing.expectError(error.DecodeError, cmd.semantic_prompt.writeCommandLine(&w.writer));
 }
 
 test "OSC 133: fresh_line" {
@@ -949,9 +1264,10 @@ test "Option.read special_key" {
 
 test "Option.read click_events" {
     const testing = std.testing;
-    try testing.expect(Option.click_events.read("click_events=1").? == true);
-    try testing.expect(Option.click_events.read("click_events=0").? == false);
     try testing.expect(Option.click_events.read("click_events=yes") == null);
+    try testing.expect(Option.click_events.read("click_events=0") == null);
+    try testing.expect(Option.click_events.read("click_events=1").? == .absolute);
+    try testing.expect(Option.click_events.read("click_events=2").? == .relative);
 }
 
 test "Option.read exit_code" {

@@ -1,9 +1,21 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const font = @import("../font/main.zig");
-const terminal = @import("../terminal/main.zig");
+const terminal_size = @import("../terminal/size.zig");
 
 const log = std.log.scoped(.renderer_size);
+
+/// Controls how extra whitespace around the terminal grid is distributed.
+pub const PaddingBalance = enum {
+    /// No balancing; padding is applied as specified explicitly.
+    false,
+    /// Balances padding but caps the top padding so the first row doesn't
+    /// drift too far from the top of the window. Excess vertical space is
+    /// shifted to the bottom.
+    true,
+    /// Distributes leftover space equally on all sides so the grid is
+    /// centered within the screen.
+    equal,
+};
 
 /// All relevant sizes for a rendered terminal. These are all the sizes that
 /// any functionality should need to know about the terminal in order to
@@ -31,10 +43,38 @@ pub const Size = struct {
         return self.screen.subPadding(self.padding);
     }
 
+    /// Resolve the exact surface pixel dimensions for an authoritative grid
+    /// using the current cell metrics and padding. Invalid or overflowing
+    /// dimensions return null without truncation.
+    pub fn screenForGrid(self: Size, requested: GridSize) ?ScreenSize {
+        if (requested.columns == 0 or requested.rows == 0 or
+            self.cell.width == 0 or self.cell.height == 0) return null;
+
+        const width = @as(u64, requested.columns) * self.cell.width +
+            self.padding.left + self.padding.right;
+        const height = @as(u64, requested.rows) * self.cell.height +
+            self.padding.top + self.padding.bottom;
+        if (width > std.math.maxInt(u32) or height > std.math.maxInt(u32))
+            return null;
+
+        const screen: ScreenSize = .{
+            .width = @intCast(width),
+            .height = @intCast(height),
+        };
+        var resolved = self;
+        resolved.screen = screen;
+        if (!resolved.grid().equals(requested)) return null;
+        return screen;
+    }
+
     /// Set the padding to be balanced around the grid. The balanced
     /// padding is calculated AFTER the explicit padding is taken
     /// into account.
-    pub fn balancePadding(self: *Size, explicit: Padding) void {
+    pub fn balancePadding(
+        self: *Size,
+        explicit: Padding,
+        mode: PaddingBalance,
+    ) void {
         // This ensure grid() does the right thing
         self.padding = explicit;
 
@@ -45,14 +85,20 @@ pub const Size = struct {
             self.cell,
         );
 
-        // The top/bottom padding is interesting. Subjectively, lots of padding
-        // at the top looks bad. So instead of always being equal (like left/right),
-        // we force the top padding to be at most equal to the maximum left padding,
-        // which is the balanced explicit horizontal padding plus half a cell width.
-        const max_padding_left = (explicit.left + explicit.right + self.cell.width) / 2;
-        const vshift = self.padding.top -| max_padding_left;
-        self.padding.top -= vshift;
-        self.padding.bottom += vshift;
+        switch (mode) {
+            .false => unreachable,
+            .equal => {},
+            .true => {
+                // Cap the top padding to avoid excessive space above the
+                // first row. The maximum is the balanced explicit horizontal
+                // padding plus half a cell width. Any excess is shifted to
+                // the bottom.
+                const max_top = (explicit.left + explicit.right + self.cell.width) / 2;
+                const vshift = self.padding.top -| max_top;
+                self.padding.top -= vshift;
+                self.padding.bottom += vshift;
+            },
+        }
     }
 };
 
@@ -161,7 +207,7 @@ pub const Coordinate = union(enum) {
 ///
 /// The units for the width and height are in world space. They have to
 /// be normalized for any renderer implementation.
-pub const CellSize = struct {
+pub const CellSize = extern struct {
     width: u32,
     height: u32,
 };
@@ -169,7 +215,7 @@ pub const CellSize = struct {
 /// The dimensions of the screen that the grid is rendered to. This is the
 /// terminal screen, so it is likely a subset of the window size. The dimensions
 /// should be in pixels.
-pub const ScreenSize = struct {
+pub const ScreenSize = extern struct {
     width: u32,
     height: u32,
 
@@ -213,8 +259,8 @@ pub const ScreenSize = struct {
 };
 
 /// The dimensions of the grid itself, in rows/columns units.
-pub const GridSize = struct {
-    pub const Unit = terminal.size.CellCountInt;
+pub const GridSize = extern struct {
+    pub const Unit = terminal_size.CellCountInt;
 
     columns: Unit = 0,
     rows: Unit = 0,
@@ -246,7 +292,7 @@ pub const GridSize = struct {
 };
 
 /// The padding to add to a screen.
-pub const Padding = struct {
+pub const Padding = extern struct {
     top: u32 = 0,
     bottom: u32 = 0,
     right: u32 = 0,
@@ -302,6 +348,45 @@ pub const Padding = struct {
     }
 };
 
+test "Size.balancePadding equal distributes whitespace equally" {
+    const testing = std.testing;
+
+    // screen=1050x850, cell=10x20, explicit=4 each side
+    // grid: (1050-8)/10=104 cols, (850-8)/20=42 rows
+    // leftover: 1050-1040=10 horizontal, 850-840=10 vertical
+    // balanced: left=right=5, top=bottom=5
+    var size: Size = .{
+        .screen = .{ .width = 1050, .height = 850 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+    size.balancePadding(.{ .top = 4, .bottom = 4, .left = 4, .right = 4 }, .equal);
+    try testing.expectEqual(size.padding.left, size.padding.right);
+    try testing.expectEqual(size.padding.top, size.padding.bottom);
+    try testing.expect(size.padding.top > 0);
+}
+
+test "Size.balancePadding true shifts excess top to bottom" {
+    const testing = std.testing;
+
+    // screen=1090x1070, cell=20x40, explicit=0
+    // grid: 1090/20=54 cols, 1070/40=26 rows
+    // leftover: 1090-1080=10, 1070-1040=30
+    // balanced: left=right=5, top=bottom=15
+    // vshift cap: (0+0+20)/2=10, vshift=15-10=5
+    // result: top=10, bottom=20
+    var size: Size = .{
+        .screen = .{ .width = 1090, .height = 1070 },
+        .cell = .{ .width = 20, .height = 40 },
+        .padding = .{},
+    };
+    size.balancePadding(.{}, .true);
+    try testing.expectEqual(size.padding.left, size.padding.right);
+    try testing.expect(size.padding.top < size.padding.bottom);
+    try testing.expectEqual(@as(u32, 10), size.padding.top);
+    try testing.expectEqual(@as(u32, 20), size.padding.bottom);
+}
+
 test "Padding balanced on zero" {
     // On some systems, our screen can be zero-sized for a bit, and we
     // don't want to end up with negative padding.
@@ -343,6 +428,48 @@ test "GridSize update rounding" {
 
     try testing.expectEqual(@as(GridSize.Unit, 3), grid.columns);
     try testing.expectEqual(@as(GridSize.Unit, 2), grid.rows);
+}
+
+test "Size.screenForGrid resolves exact logical dimensions" {
+    const size: Size = .{
+        .screen = .{ .width = 1, .height = 1 },
+        .cell = .{ .width = 9, .height = 17 },
+        .padding = .{ .left = 3, .right = 5, .top = 7, .bottom = 11 },
+    };
+
+    const screen = size.screenForGrid(.{
+        .columns = 120,
+        .rows = 40,
+    }).?;
+    try std.testing.expectEqual(@as(u32, 1088), screen.width);
+    try std.testing.expectEqual(@as(u32, 698), screen.height);
+
+    var resolved = size;
+    resolved.screen = screen;
+    try std.testing.expectEqual(
+        GridSize{ .columns = 120, .rows = 40 },
+        resolved.grid(),
+    );
+}
+
+test "Size.screenForGrid rejects zero and overflow" {
+    const normal: Size = .{
+        .screen = .{ .width = 0, .height = 0 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{},
+    };
+    try std.testing.expect(normal.screenForGrid(.{ .columns = 0, .rows = 1 }) == null);
+    try std.testing.expect(normal.screenForGrid(.{ .columns = 1, .rows = 0 }) == null);
+
+    const overflowing: Size = .{
+        .screen = .{ .width = 0, .height = 0 },
+        .cell = .{ .width = std.math.maxInt(u32), .height = 1 },
+        .padding = .{ .left = 1 },
+    };
+    try std.testing.expect(overflowing.screenForGrid(.{
+        .columns = 2,
+        .rows = 1,
+    }) == null);
 }
 
 test "coordinate conversion" {

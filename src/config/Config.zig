@@ -29,7 +29,7 @@ const file_load = @import("file_load.zig");
 const formatterpkg = @import("formatter.zig");
 const themepkg = @import("theme.zig");
 const url = @import("url.zig");
-const Key = @import("key.zig").Key;
+pub const Key = @import("key.zig").Key;
 const MetricModifier = fontpkg.Metrics.Modifier;
 const help_strings = @import("help_strings");
 pub const Command = @import("command.zig").Command;
@@ -39,6 +39,8 @@ pub const Path = @import("path.zig").Path;
 pub const RepeatablePath = @import("path.zig").RepeatablePath;
 const ClipboardCodepointMap = @import("ClipboardCodepointMap.zig");
 const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
+pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
+const string = @import("string.zig");
 
 // We do this instead of importing all of terminal/main.zig to
 // limit the dependency graph. This is important because some things
@@ -47,7 +49,8 @@ const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
 const terminal = struct {
     const CursorStyle = @import("../terminal/cursor.zig").Style;
     const color = @import("../terminal/color.zig");
-    const x11_color = @import("../terminal/x11_color.zig");
+    const selection_codepoints = @import("../terminal/selection_codepoints.zig");
+    const style = @import("../terminal/style.zig");
 };
 
 const log = std.log.scoped(.config);
@@ -95,10 +98,9 @@ pub const compatibility = std.StaticStringMap(
 });
 
 /// Set Ghostty's graphical user interface language to a language other than the
-/// system default language. The language must be fully specified, including the
-/// encoding. For example:
+/// system default language. For example:
 ///
-///     language = de_DE.UTF-8
+///     language = de
 ///
 /// will force the strings in Ghostty's graphical user interface to be in German
 /// rather than the system default.
@@ -749,12 +751,12 @@ foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
 /// The null character (U+0000) is always treated as a boundary and does not
 /// need to be included in this configuration.
 ///
-/// Default: ` \t'"│`|:;,()[]{}<>$`
+/// Default: ``\t '"│`|:;,()[]{}<>$``
 ///
 /// To add or remove specific characters, you can set this to a custom value.
 /// For example, to treat semicolons as part of words:
 ///
-///     selection-word-chars = " \t'\"│`|:,()[]{}<>$"
+///     selection-word-chars = "\t '\"│`|:,()[]{}<>$"
 ///
 /// Available since: 1.3.0
 @"selection-word-chars": SelectionWordChars = .{},
@@ -802,11 +804,35 @@ palette: Palette = .{},
 /// look. Colors that have been explicitly set via `palette` are never
 /// overwritten.
 ///
+/// The default value is false (disabled), because many legacy programs
+/// using the 256-color palette hardcode assumptions about what these
+/// colors are (mostly assuming the xterm 256 color palette). However, this
+/// is still a very useful tool for theme authors and users who want
+/// to customize their palette without having to specify all 256 colors.
+///
 /// For more information on how the generation works, see here:
 /// https://gist.github.com/jake-stewart/0a8ea46159a7da2c808e5be2177e1783
 ///
 /// Available since: 1.3.0
-@"palette-generate": bool = true,
+@"palette-generate": bool = false,
+
+/// Invert the palette colors generated when `palette-generate` is enabled,
+/// so that the colors go in reverse order. This allows palette-based
+/// applications to work well in both light and dark mode since the
+/// palettes are always relatively good colors.
+///
+/// This defaults to off because some legacy terminal applications
+/// hardcode the assumption that palette indices 16–231 are ordered from
+/// darkest to lightest, so enabling this would make them unreadable.
+/// This is not a generally good assumption and we encourage modern
+/// terminal applications to use the indices in a more semantic way.
+///
+/// This has no effect if `palette-generate` is disabled.
+///
+/// For more information see `palette-generate`.
+///
+/// Available since: 1.3.0
+@"palette-harmonious": bool = false,
 
 /// The color of the cursor. If this is not set, a default will be chosen.
 ///
@@ -874,19 +900,18 @@ palette: Palette = .{},
 /// background color.
 @"cursor-text": ?TerminalColor = null,
 
-/// Enables the ability to move the cursor at prompts by using `alt+click` on
-/// Linux and `option+click` on macOS.
+/// Enables the ability to move the cursor at prompts by clicking on a
+/// location in the prompt text.
 ///
-/// This feature requires shell integration (specifically prompt marking
-/// via `OSC 133`) and only works in primary screen mode. Alternate screen
-/// applications like vim usually have their own version of this feature but
-/// this configuration doesn't control that.
+/// This feature requires shell integration, specifically prompt marking
+/// via `OSC 133`. Some shells like Fish (v4) and Nu (0.111+) natively
+/// support this while others may require additional configuration or
+/// Ghostty's shell integration features to be enabled.
 ///
-/// It should be noted that this feature works by translating your desired
-/// position into a series of synthetic arrow key movements, so some weird
-/// behavior around edge cases are to be expected. This is unfortunately how
-/// this feature is implemented across terminals because there isn't any other
-/// way to implement it.
+/// Depending on the shell, this works either by translating your click
+/// position into a series of synthetic arrow key movements or by sending
+/// a click event directly to the shell. In either case, some unexpected
+/// behavior around edge cases is possible.
 @"cursor-click-to-move": bool = true,
 
 /// Hide the mouse immediately when typing. The mouse becomes visible again
@@ -906,7 +931,7 @@ palette: Palette = .{},
 ///   anything but modifiers or keybinds that are processed by Ghostty).
 ///
 /// - `output` If set, scroll the surface to the bottom if there is new data
-///   to display. (Currently unimplemented.)
+///   to display (e.g., when new lines are printed to the terminal).
 ///
 /// The default is `keystroke, no-output`.
 @"scroll-to-bottom": ScrollToBottom = .default,
@@ -1033,6 +1058,14 @@ palette: Palette = .{},
 /// in order to support background blur, as there isn't a unified interface for
 /// doing so.
 @"background-blur": BackgroundBlur = .false,
+
+/// When true on macOS, the terminal background color is expected to be
+/// provided by the host CALayer's backgroundColor rather than the GPU
+/// full-screen background pass. The renderer sets bg_color alpha to 0
+/// so that the layer background shows through without alpha double-stacking.
+/// This allows embedding apps to provide instant background coverage
+/// during view resizes.
+@"macos-background-from-layer": bool = false,
 
 /// The opacity level (opposite of transparency) of an unfocused split.
 /// Unfocused splits by default are slightly faded out to make it easier to see
@@ -1188,8 +1221,6 @@ command: ?Command = null,
 /// notifications for a single command, overriding the `never` and `unfocused`
 /// options.
 ///
-/// GTK only.
-///
 /// Available since 1.3.0.
 @"notify-on-command-finish": NotifyOnCommandFinish = .never,
 
@@ -1203,8 +1234,6 @@ command: ?Command = null,
 ///
 /// Options can be combined by listing them as a comma separated list. Options
 /// can be negated by prefixing them with `no-`. For example `no-bell,notify`.
-///
-/// GTK only.
 ///
 /// Available since 1.3.0.
 @"notify-on-command-finish-action": NotifyOnCommandFinishAction = .{
@@ -1242,8 +1271,6 @@ command: ?Command = null,
 ///
 /// The maximum value is `584y 49w 23h 34m 33s 709ms 551µs 615ns`. Any
 /// value larger than this will be clamped to the maximum value.
-///
-/// GTK only.
 ///
 /// Available since 1.3.0
 @"notify-on-command-finish-after": Duration = .{ .duration = 5 * std.time.ns_per_s },
@@ -1354,10 +1381,17 @@ input: RepeatableReadableIO = .{},
 /// When this limit is reached, the oldest lines are removed from the
 /// scrollback.
 ///
-/// Scrollback currently exists completely in memory. This means that the
-/// larger this value, the larger potential memory usage. Scrollback is
-/// allocated lazily up to this limit, so if you set this to a very large
-/// value, it will not immediately consume a lot of memory.
+/// Scrollback is stored in memory and allocated lazily up to this limit, so
+/// setting a very large limit does not immediately consume that amount of
+/// memory. On supported systems with scrollback compression enabled, Ghostty
+/// attempts to compress fully historical pages which are not currently visible
+/// while the terminal is idle. This can reduce physical memory usage, depending
+/// on the contents of the scrollback.
+///
+/// This limit always measures the uncompressed logical size of the terminal
+/// pages. Compression does not allow Ghostty to retain more history than the
+/// configured limit. Accessing compressed history restores it transparently
+/// and may increase the terminal's physical memory usage again.
 ///
 /// This size is per terminal surface, not for the entire application.
 ///
@@ -1365,7 +1399,31 @@ input: RepeatableReadableIO = .{},
 /// This is a future planned feature.
 ///
 /// This can be changed at runtime but will only affect new terminal surfaces.
-@"scrollback-limit": usize = 10_000_000, // 10MB
+@"scrollback-limit": usize = 50_000_000, // 50MB
+
+/// Whether to compress scrollback pages while the terminal is idle.
+///
+/// Ghostty does its best to only compress when idle and decompress
+/// as needed. This means that compression doesn't lower IO throughput.
+/// We recommend you keep it on.
+///
+/// The scrollback limit remains an uncompressed logical limit regardless of
+/// this setting, so disabling compression can increase physical memory usage
+/// but does not change how much history is retained.
+///
+/// Text-heavy terminal history generally compresses to approximately 10% to
+/// 30% of its uncompressed page memory, corresponding to a 70% to 90% reduction
+/// in physical memory for pages which are compressed. Compression savings are
+/// content-dependent.
+///
+/// Note that the way Ghostty works is that we compress and discard the
+/// physical/resident memory but we retain virtual mappings. You will not
+/// see a decrease in virtual memory usage, but you will see a decrease
+/// in physical/memory usage.
+///
+/// Changing this at runtime affects future compression work. Pages which are
+/// already compressed remain compressed until their contents are accessed.
+@"scrollback-compression": bool = true,
 
 /// Control when the scrollbar is shown to scroll the scrollback buffer.
 ///
@@ -1381,8 +1439,6 @@ input: RepeatableReadableIO = .{},
 ///   * `never` - Never show a scrollbar. You can still scroll using the mouse,
 ///     keybind actions, etc. but you will not have a visual UI widget showing
 ///     a scrollbar.
-///
-/// This only applies to macOS currently. GTK doesn't yet support scrollbars.
 scrollbar: Scrollbar = .system,
 
 /// Match a regular expression against the terminal text and associate clicking
@@ -1428,10 +1484,27 @@ maximize: bool = false,
 /// does not apply to tabs, splits, etc. However, this setting will apply to all
 /// new windows, not just the first one.
 ///
-/// On macOS, this setting does not work if window-decoration is set to
-/// "none", because native fullscreen on macOS requires window decorations
-/// to be set.
-fullscreen: bool = false,
+/// Allowable values are:
+///
+///   * `false` - Don't start in fullscreen (default)
+///   * `true` - Start in native fullscreen
+///   * `non-native` - (macOS only) Start in non-native fullscreen, hiding the
+///     menu bar. This is faster than native fullscreen since it doesn't use
+///     animations. On non-macOS platforms, this behaves the same as `true`.
+///   * `non-native-visible-menu` - (macOS only) Start in non-native fullscreen,
+///     keeping the menu bar visible. On non-macOS platforms, behaves like `true`.
+///   * `non-native-padded-notch` - (macOS only) Start in non-native fullscreen,
+///     hiding the menu bar but padding for the notch on applicable devices.
+///     On non-macOS platforms, behaves like `true`.
+///
+/// Important: tabs DO NOT WORK with non-native fullscreen modes. Non-native
+/// fullscreen removes the titlebar and macOS native tabs require the titlebar.
+/// If you use tabs, use `true` (native) instead.
+///
+/// On macOS, `true` (native fullscreen) does not work if `window-decoration`
+/// is set to `false`, because native fullscreen on macOS requires window
+/// decorations.
+fullscreen: Fullscreen = .false,
 
 /// The title Ghostty will use for the window. This will force the title of the
 /// window to be this title at all times and Ghostty will ignore any set title
@@ -1492,13 +1565,14 @@ class: ?[:0]const u8 = null,
 /// `open`, then it defaults to `home`. On Linux with GTK, if Ghostty can detect
 /// it was launched from a desktop launcher, then it defaults to `home`.
 ///
-/// The value of this must be an absolute value or one of the special values
-/// below:
+/// The value of this must be an absolute path, a path prefixed with `~/`
+/// (the tilde will be expanded to the user's home directory), or
+/// one of the special values below:
 ///
 ///   * `home` - The home directory of the executing user.
 ///
 ///   * `inherit` - The working directory of the launching process.
-@"working-directory": ?[]const u8 = null,
+@"working-directory": ?WorkingDirectory = null,
 
 /// Key bindings. The format is `trigger=action`. Duplicate triggers will
 /// overwrite previously set values. The list of actions is available in
@@ -1822,6 +1896,12 @@ class: ?[:0]const u8 = null,
 ///     If an invalid key is pressed, the sequence ends but the table remains
 ///     active.
 ///
+///   * Chain actions work within tables, the `chain` keyword applies to
+///     the most recently defined binding in the table. e.g. if you set
+///     `table/ctrl+a=new_window` you can chain by using `chain=text:hello`.
+///     Important: chain itself doesn't get prefixed with the table name,
+///     since it applies to the most recent binding in any table.
+///
 ///   * Prefixes like `global:` work within tables:
 ///     `foo/global:ctrl+a=new_window`.
 ///
@@ -1924,7 +2004,16 @@ keybind: Keybinds = .{},
 /// apply. The other padding is applied first and may affect how many grid cells
 /// actually exist, and this is applied last in order to balance the padding
 /// given a certain viewport size and grid cell size.
-@"window-padding-balance": bool = false,
+///
+/// Valid values are:
+///
+/// * `false` - No balancing is applied.
+/// * `true` - Balance the padding, but cap the top padding to avoid
+///   excessive space above the first row. Any excess is shifted to the
+///   bottom.
+/// * `equal` - Balance the padding equally on all sides without any
+///   top-padding cap. (Available since: 1.4.0)
+@"window-padding-balance": WindowPaddingBalance = .false,
 
 /// The color of the padding area of the window. Valid values are:
 ///
@@ -2354,8 +2443,12 @@ keybind: Keybinds = .{},
 /// The value `clipboard` will always copy text to the selection clipboard
 /// as well as the system clipboard.
 ///
-/// Middle-click paste will always use the selection clipboard. Middle-click
-/// paste is always enabled even if this is `false`.
+/// Middle-click primary paste (see `middle-click-action`) is enabled by
+/// default even if this is `false`. The clipboard it pastes from follows
+/// this setting: with `true` (or `false`) it reads from the selection
+/// clipboard (falling back to the system clipboard on platforms without a
+/// selection clipboard); with `clipboard` it reads from the system
+/// clipboard.
 ///
 /// The default value is true on Linux and macOS.
 @"copy-on-select": CopyOnSelect = switch (builtin.os.tag) {
@@ -2376,6 +2469,16 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `context-menu`.
 @"right-click-action": RightClickAction = .@"context-menu",
+
+/// The action to take when the user middle-clicks on the terminal surface.
+///
+/// Valid values:
+///   * `primary-paste` - Paste from the selection (or system) clipboard per
+///      `copy-on-select`.
+///   * `ignore` - Do nothing, ignore the middle click.
+///
+/// The default value is `primary-paste`.
+@"middle-click-action": MiddleClickAction = .@"primary-paste",
 
 /// The time in milliseconds between clicks to consider a click a repeat
 /// (double, triple, etc.) or an entirely new single click. A value of zero will
@@ -2639,7 +2742,13 @@ keybind: Keybinds = .{},
 /// The default value is `main` because this is the recommended screen
 /// by the operating system.
 ///
-/// Only implemented on macOS.
+/// On macOS, `macos-menu-bar` uses the screen containing the menu bar.
+/// On Linux/Wayland, `macos-menu-bar` is treated as equivalent to `main`.
+///
+/// Note: On Linux, there is no universal concept of a "primary" monitor.
+/// Ghostty uses the compositor-reported primary output when available and
+/// falls back to the first monitor reported by GDK if no primary output can
+/// be resolved.
 @"quick-terminal-screen": QuickTerminalScreen = .main,
 
 /// Duration (in seconds) of the quick terminal enter and exit animation.
@@ -2810,9 +2919,16 @@ keybind: Keybinds = .{},
 /// command-palette-entry = title:"Ghostty",description:"Add a little Ghostty to your terminal.",action:"text:\xf0\x9f\x91\xbb"
 /// ```
 ///
+/// There are some additional special values that can be specified for
+/// command-palette-entry:
+///
+///   * `command-palette-entry=clear` will clear all command entries. Warning: this
+///     removes ALL entries up to this point, including the default
+///     entries. Available since: 1.4.0
+///
 /// By default, the command palette is preloaded with most actions that might
 /// be useful in an interactive setting yet do not have easily accessible or
-/// memorizable shortcuts. The default entries can be cleared by setting this
+/// memorizable shortcuts. The default entries can be restored by setting this
 /// setting to an empty value:
 ///
 /// ```ini
@@ -2904,6 +3020,20 @@ keybind: Keybinds = .{},
 ///
 ///  * `vec4 iPreviousCursorColor` - Color of the previous terminal cursor.
 ///
+///  * `vec4 iCurrentCursorStyle` - Style of the terminal cursor
+///
+///    Macros simplified use are defined for the various cursor styles:
+///
+///    - `CURSORSTYLE_BLOCK` or `0`
+///    - `CURSORSTYLE_BLOCK_HOLLOW` or `1`
+///    - `CURSORSTYLE_BAR` or `2`
+///    - `CURSORSTYLE_UNDERLINE` or `3`
+///    - `CURSORSTYLE_LOCK` or `4`
+///
+///  * `vec4 iPreviousCursorStyle` - Style of the previous terminal cursor
+///
+///  * `vec4 iCursorVisible` - Visibility of the terminal cursor.
+///
 ///  * `float iTimeCursorChange` - Timestamp of terminal cursor change.
 ///
 ///    When the terminal cursor changes position or color, this is set to
@@ -2993,7 +3123,7 @@ keybind: Keybinds = .{},
 ///
 ///  * `audio`
 ///
-///    Play a custom sound. (GTK only)
+///    Play a custom sound. (Available since 1.3.0 on macOS)
 ///
 ///  * `attention` *(enabled by default)*
 ///
@@ -3033,17 +3163,16 @@ keybind: Keybinds = .{},
 /// the path is not absolute, it is considered relative to the directory of the
 /// configuration file that it is referenced from, or from the current working
 /// directory if this is used as a CLI flag. The path may be prefixed with `~/`
-/// to reference the user's home directory. (GTK only)
+/// to reference the user's home directory.
 ///
-/// Available since: 1.2.0
+/// Available since: 1.2.0 on GTK, 1.3.0 on macOS.
 @"bell-audio-path": ?Path = null,
 
 /// If `audio` is an enabled bell feature, this is the volume to play the audio
 /// file at (relative to the system volume). This is a floating point number
 /// ranging from 0.0 (silence) to 1.0 (as loud as possible). The default is 0.5.
-/// (GTK only)
 ///
-/// Available since: 1.2.0
+/// Available since: 1.2.0 on GTK, 1.3.0 on macOS.
 @"bell-audio-volume": f64 = 0.5,
 
 /// Control the in-app notifications that Ghostty shows.
@@ -3293,6 +3422,16 @@ keybind: Keybinds = .{},
 /// always have secure input enabled, the indication can be distracting and
 /// you may want to disable it.
 @"macos-secure-input-indication": bool = true,
+
+/// If true, Ghostty exposes and handles the built-in AppleScript dictionary
+/// on macOS.
+///
+/// If false, all AppleScript interactions are disabled. This includes
+/// AppleScript commands and AppleScript object lookup for windows, tabs,
+/// and terminals.
+///
+/// The default is true.
+@"macos-applescript": bool = true,
 
 /// Customize the macOS app icon.
 ///
@@ -3556,6 +3695,14 @@ else
 /// which is the old style.
 @"gtk-wide-tabs": bool = true,
 
+/// If `true` (default), then two-finger horizontal scrolling on a touchpad
+/// will switch between tabs. Scrolling left goes to the next tab and
+/// scrolling right goes to the previous tab. Set this to `false` to
+/// disable this behavior.
+///
+/// Available since 1.4.0.
+@"gtk-horizontal-tab-scroll": bool = true,
+
 /// Custom CSS files to be loaded.
 ///
 /// GTK CSS documentation can be found at the following links:
@@ -3582,6 +3729,11 @@ else
 /// If `true` (default), applications running in the terminal can show desktop
 /// notifications using certain escape sequences such as OSC 9 or OSC 777.
 @"desktop-notifications": bool = true,
+
+/// If `true` (default), applications running in the terminal can show
+/// graphical progress bars using the ConEmu OSC 9;4 escape sequence.
+/// If `false`, progress bar sequences are silently ignored.
+@"progress-style": bool = true,
 
 /// Modifies the color used for bold text in the terminal.
 ///
@@ -3751,6 +3903,8 @@ pub fn load(alloc_gpa: Allocator) !Config {
     return result;
 }
 
+const default_link_matcher_count = 2;
+
 pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
     // Build up our basic config
     var result: Config = .{
@@ -3767,12 +3921,68 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
 
     // Add our default link for URL detection
     try result.link.links.append(alloc, .{
-        .regex = url.regex,
+        .regex = url.scheme_regex,
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .candidate_scope = .bounded_logical,
+        .hard_wrap_continuations = true,
     });
+    try result.link.links.append(alloc, .{
+        .regex = url.path_regex,
+        .action = .{ .open = {} },
+        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .hard_wrap_continuations = true,
+        .hard_wrap_match_delimiter = true,
+    });
+    result.link.default_matchers_present = true;
 
     return result;
+}
+
+test "Config: default URL and path links use owned candidate scopes" {
+    var config = try Config.default(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(default_link_matcher_count, config.link.links.items.len);
+    try std.testing.expectEqual(
+        inputpkg.Link.CandidateScope.bounded_logical,
+        config.link.links.items[0].candidate_scope,
+    );
+    try std.testing.expectEqual(
+        inputpkg.Link.CandidateScope.semantic,
+        config.link.links.items[1].candidate_scope,
+    );
+    try std.testing.expect(config.link.links.items[0].hard_wrap_continuations);
+    try std.testing.expect(config.link.links.items[1].hard_wrap_continuations);
+    try std.testing.expect(!config.link.links.items[0].hard_wrap_match_delimiter);
+    try std.testing.expect(config.link.links.items[1].hard_wrap_match_delimiter);
+}
+
+test "Config: disabling URL links is idempotent and preserves custom matchers" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+
+    try config.link.links.append(config.arenaAlloc(), .{
+        .regex = "custom",
+        .action = .{ .open = {} },
+        .highlight = .hover,
+    });
+    config.@"link-url" = false;
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    var config_clone = try config.clone(testing.allocator);
+    defer config_clone.deinit();
+    try config_clone.finalize();
+    try testing.expectEqual(@as(usize, 1), config_clone.link.links.items.len);
+    try testing.expectEqualStrings("custom", config_clone.link.links.items[0].regex);
 }
 
 /// Load configuration from an iterator that yields values that look like
@@ -3813,6 +4023,15 @@ fn loadFsFile(self: *Config, alloc: Allocator, file: *std.fs.File, path: []const
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
     try self.loadReader(alloc, reader, path);
+}
+
+/// Load config from in-memory contents.
+///
+/// `path` is used only as the synthetic source path for diagnostics and for
+/// resolving relative config values.
+pub fn loadString(self: *Config, alloc: Allocator, contents: []const u8, path: []const u8) !void {
+    var reader: std.Io.Reader = .fixed(contents);
+    try self.loadReader(alloc, &reader, path);
 }
 
 /// Load config from the given Reader.
@@ -3950,10 +4169,28 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
         const app_support_path = try file_load.preferredAppSupportPath(alloc);
         defer alloc.free(app_support_path);
         const app_support_loaded: bool = loaded: {
-            const legacy_app_support_action = self.loadOptionalFile(alloc, legacy_app_support_path);
-            const app_support_action = self.loadOptionalFile(alloc, app_support_path);
+            const legacy_app_support_action = self.loadOptionalFile(
+                alloc,
+                legacy_app_support_path,
+            );
+
+            // The app support path and legacy may be the same, since we
+            // use the `preferred` call above. If its the same, avoid
+            // a double-load.
+            const app_support_action: OptionalFileAction = if (!std.mem.eql(
+                u8,
+                legacy_app_support_path,
+                app_support_path,
+            )) self.loadOptionalFile(
+                alloc,
+                app_support_path,
+            ) else .not_found;
+
             if (app_support_action != .not_found and legacy_app_support_action != .not_found) {
-                log.warn("both config files `{s}` and `{s}` exist.", .{ legacy_app_support_path, app_support_path });
+                log.warn(
+                    "both config files `{s}` and `{s}` exist.",
+                    .{ legacy_app_support_path, app_support_path },
+                );
                 log.warn("loading them both in that order", .{});
                 break :loaded true;
             }
@@ -4438,23 +4675,18 @@ pub fn finalize(self: *Config) !void {
     }
 
     // The default for the working directory depends on the system.
-    const wd = self.@"working-directory" orelse if (probable_cli)
-        // From the CLI, we want to inherit where we were launched from.
-        "inherit"
+    var wd: WorkingDirectory = self.@"working-directory" orelse if (probable_cli)
+        .inherit
     else
-        // Otherwise we typically just want the home directory because
-        // our pwd is probably a runtime state dir or root or something
-        // (launchers and desktop environments typically do this).
-        "home";
+        .home;
 
     // If we are missing either a command or home directory, we need
     // to look up defaults which is kind of expensive. We only do this
     // on desktop.
-    const wd_home = std.mem.eql(u8, "home", wd);
     if ((comptime !builtin.target.cpu.arch.isWasm()) and
         (comptime !builtin.is_test))
     {
-        if (self.command == null or wd_home) command: {
+        if (self.command == null or wd == .home) command: {
             // First look up the command using the SHELL env var if needed.
             // We don't do this in flatpak because SHELL in Flatpak is always
             // set to /bin/sh.
@@ -4476,7 +4708,7 @@ pub fn finalize(self: *Config) !void {
                     self.command = .{ .shell = copy };
 
                     // If we don't need the working directory, then we can exit now.
-                    if (!wd_home) break :command;
+                    if (wd != .home) break :command;
                 } else |_| {}
             }
 
@@ -4487,10 +4719,12 @@ pub fn finalize(self: *Config) !void {
                         self.command = .{ .shell = "cmd.exe" };
                     }
 
-                    if (wd_home) {
+                    if (wd == .home) {
                         var buf: [std.fs.max_path_bytes]u8 = undefined;
                         if (try internal_os.home(&buf)) |home| {
-                            self.@"working-directory" = try alloc.dupe(u8, home);
+                            wd = .{ .path = try alloc.dupe(u8, home) };
+                        } else {
+                            wd = .inherit;
                         }
                     }
                 },
@@ -4505,10 +4739,12 @@ pub fn finalize(self: *Config) !void {
                         }
                     }
 
-                    if (wd_home) {
+                    if (wd == .home) {
                         if (pw.home) |home| {
                             log.info("default working directory src=passwd value={s}", .{home});
-                            self.@"working-directory" = home;
+                            wd = .{ .path = home };
+                        } else {
+                            wd = .inherit;
                         }
                     }
 
@@ -4519,6 +4755,8 @@ pub fn finalize(self: *Config) !void {
             }
         }
     }
+    try wd.finalize(alloc);
+    self.@"working-directory" = wd;
 
     // Apprt-specific defaults
     switch (build_config.app_runtime) {
@@ -4536,10 +4774,6 @@ pub fn finalize(self: *Config) !void {
             }
         },
     }
-
-    // If we have the special value "inherit" then set it to null which
-    // does the same. In the future we should change to a tagged union.
-    if (std.mem.eql(u8, wd, "inherit")) self.@"working-directory" = null;
 
     // Default our click interval
     if (self.@"click-repeat-interval" == 0 and
@@ -4562,9 +4796,8 @@ pub fn finalize(self: *Config) !void {
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
 
-    // If URLs are disabled, cut off the first link. The first link is
-    // always the URL matcher.
-    if (!self.@"link-url") self.link.links.items = self.link.links.items[1..];
+    // If URLs are disabled, remove the built-in URL and path matchers.
+    if (!self.@"link-url") self.link.removeDefaultMatchers();
 
     // We warn when the quit-after-last-window-closed-delay is set to a very
     // short value because it can cause Ghostty to quit before the first
@@ -4740,8 +4973,8 @@ fn compatBoldIsBright(
     _ = alloc;
     assert(std.mem.eql(u8, key, "bold-is-bright"));
 
-    const set = cli.args.parseBool(value_ orelse "t") catch return false;
-    if (set) {
+    const isset = cli.args.parseBool(value_ orelse "t") catch return false;
+    if (isset) {
         self.@"bold-color" = .bright;
     }
 
@@ -5136,6 +5369,17 @@ pub const NonNativeFullscreen = enum(c_int) {
     @"padded-notch",
 };
 
+/// Valid values for fullscreen config option
+/// c_int because it needs to be extern compatible
+/// If this is changed, you must also update ghostty.h
+pub const Fullscreen = enum(c_int) {
+    false,
+    true,
+    @"non-native",
+    @"non-native-visible-menu",
+    @"non-native-padded-notch",
+};
+
 pub const WindowPaddingColor = enum {
     background,
     extend,
@@ -5151,6 +5395,127 @@ pub const LinkPreviews = enum {
     false,
     true,
     osc8,
+};
+
+/// See working-directory
+pub const WorkingDirectory = union(enum) {
+    const Self = @This();
+
+    /// Resolve to the current user's home directory during config finalize.
+    home,
+
+    /// Inherit the working directory from the launching process.
+    inherit,
+
+    /// Use an explicit working directory path. This may be not be
+    /// expanded until finalize is called.
+    path: []const u8,
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input_: ?[]const u8) !void {
+        var input = input_ orelse return error.ValueRequired;
+        input = std.mem.trim(u8, input, &std.ascii.whitespace);
+        if (input.len == 0) return error.ValueRequired;
+
+        // Match path.zig behavior for quoted values.
+        if (input.len >= 2 and input[0] == '"' and input[input.len - 1] == '"') {
+            input = input[1 .. input.len - 1];
+        }
+
+        if (std.mem.eql(u8, input, "home")) {
+            self.* = .home;
+            return;
+        }
+
+        if (std.mem.eql(u8, input, "inherit")) {
+            self.* = .inherit;
+            return;
+        }
+
+        self.* = .{ .path = try alloc.dupe(u8, input) };
+    }
+
+    /// Expand tilde paths in .path values.
+    pub fn finalize(self: *Self, alloc: Allocator) Allocator.Error!void {
+        const path = switch (self.*) {
+            .path => |path| path,
+            else => return,
+        };
+
+        if (!std.mem.startsWith(u8, path, "~/")) return;
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const expanded = internal_os.expandHome(path, &buf) catch |err| {
+            log.warn(
+                "error expanding home directory for working-directory path={s}: {}",
+                .{ path, err },
+            );
+            return;
+        };
+
+        if (std.mem.eql(u8, expanded, path)) return;
+        self.* = .{ .path = try alloc.dupe(u8, expanded) };
+    }
+
+    pub fn value(self: Self) ?[]const u8 {
+        return switch (self) {
+            .path => |path| path,
+            .home, .inherit => null,
+        };
+    }
+
+    pub fn clone(self: Self, alloc: Allocator) Allocator.Error!Self {
+        return switch (self) {
+            .path => |path| .{ .path = try alloc.dupe(u8, path) },
+            else => self,
+        };
+    }
+
+    pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
+        switch (self) {
+            .home, .inherit => try formatter.formatEntry([]const u8, @tagName(self)),
+            .path => |path| try formatter.formatEntry([]const u8, path),
+        }
+    }
+
+    test "WorkingDirectory parseCLI" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var wd: Self = .inherit;
+
+        try wd.parseCLI(alloc, "inherit");
+        try testing.expectEqual(.inherit, wd);
+
+        try wd.parseCLI(alloc, "home");
+        try testing.expectEqual(.home, wd);
+
+        try wd.parseCLI(alloc, "~/projects/ghostty");
+        try testing.expectEqualStrings("~/projects/ghostty", wd.path);
+
+        try wd.parseCLI(alloc, "\"/tmp path\"");
+        try testing.expectEqualStrings("/tmp path", wd.path);
+    }
+
+    test "WorkingDirectory finalize" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        {
+            var wd: Self = .{ .path = "~/projects/ghostty" };
+            try wd.finalize(alloc);
+
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const expected = internal_os.expandHome(
+                "~/projects/ghostty",
+                &buf,
+            ) catch "~/projects/ghostty";
+            try testing.expectEqualStrings(expected, wd.value().?);
+        }
+    }
 };
 
 /// Color represents a color using RGB.
@@ -5180,16 +5545,8 @@ pub const Color = struct {
 
     pub fn parseCLI(input_: ?[]const u8) !Color {
         const input = input_ orelse return error.ValueRequired;
-        // Trim any whitespace before processing
-        const trimmed = std.mem.trim(u8, input, " \t");
-
-        if (terminal.x11_color.map.get(trimmed)) |rgb| return .{
-            .r = rgb.r,
-            .g = rgb.g,
-            .b = rgb.b,
-        };
-
-        return fromHex(trimmed);
+        const rgb: terminal.color.RGB = terminal.color.RGB.parse(input) catch return error.InvalidValue;
+        return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -5220,48 +5577,15 @@ pub const Color = struct {
         ) catch error.OutOfMemory;
     }
 
-    /// fromHex parses a color from a hex value such as #RRGGBB. The "#"
-    /// is optional.
-    pub fn fromHex(input: []const u8) !Color {
-        // Trim the beginning '#' if it exists
-        const trimmed = if (input.len != 0 and input[0] == '#') input[1..] else input;
-        if (trimmed.len != 6 and trimmed.len != 3) return error.InvalidValue;
-
-        // Expand short hex values to full hex values
-        const rgb: []const u8 = if (trimmed.len == 3) &.{
-            trimmed[0], trimmed[0],
-            trimmed[1], trimmed[1],
-            trimmed[2], trimmed[2],
-        } else trimmed;
-
-        // Parse the colors two at a time.
-        var result: Color = undefined;
-        comptime var i: usize = 0;
-        inline while (i < 6) : (i += 2) {
-            const v: u8 =
-                ((try std.fmt.charToDigit(rgb[i], 16)) * 16) +
-                try std.fmt.charToDigit(rgb[i + 1], 16);
-
-            @field(result, switch (i) {
-                0 => "r",
-                2 => "g",
-                4 => "b",
-                else => unreachable,
-            }) = v;
-        }
-
-        return result;
-    }
-
-    test "fromHex" {
+    test "parseCLI hex" {
         const testing = std.testing;
 
-        try testing.expectEqual(Color{ .r = 0, .g = 0, .b = 0 }, try Color.fromHex("#000000"));
-        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.fromHex("#0A0B0C"));
-        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.fromHex("0A0B0C"));
-        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.fromHex("FFFFFF"));
-        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.fromHex("FFF"));
-        try testing.expectEqual(Color{ .r = 51, .g = 68, .b = 85 }, try Color.fromHex("#345"));
+        try testing.expectEqual(Color{ .r = 0, .g = 0, .b = 0 }, try Color.parseCLI("#000000"));
+        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.parseCLI("#0A0B0C"));
+        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.parseCLI("0A0B0C"));
+        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.parseCLI("FFFFFF"));
+        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.parseCLI("FFF"));
+        try testing.expectEqual(Color{ .r = 51, .g = 68, .b = 85 }, try Color.parseCLI("#345"));
     }
 
     test "parseCLI from name" {
@@ -5361,6 +5685,14 @@ pub const TerminalColor = union(enum) {
 pub const BoldColor = union(enum) {
     color: Color,
     bright,
+
+    /// Convert to the terminal-native BoldColor type.
+    pub fn toTerminal(self: BoldColor) terminal.style.Style.BoldColor {
+        return switch (self) {
+            .color => |col| .{ .color = col.toTerminalRGB() },
+            .bright => .bright,
+        };
+    }
 
     pub fn parseCLI(input_: ?[]const u8) !BoldColor {
         const input = input_ orelse return error.ValueRequired;
@@ -5578,7 +5910,7 @@ pub const Palette = struct {
 
     /// ghostty_config_palette_s
     pub const C = extern struct {
-        colors: [265]Color.C,
+        colors: [256]Color.C,
     };
 
     pub fn cval(self: Self) Palette.C {
@@ -5599,20 +5931,12 @@ pub const Palette = struct {
         input: ?[]const u8,
     ) !void {
         const value = input orelse return error.ValueRequired;
-        const eqlIdx = std.mem.indexOf(u8, value, "=") orelse
-            return error.InvalidValue;
-
-        // Parse the key part (trim whitespace)
-        const key = try std.fmt.parseInt(
-            u8,
-            std.mem.trim(u8, value[0..eqlIdx], " \t"),
-            0,
-        );
-
-        // Parse the color part (Color.parseCLI will handle whitespace)
-        const rgb = try Color.parseCLI(value[eqlIdx + 1 ..]);
-        self.value[key] = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
-        self.mask.set(key);
+        const entry = terminal.color.parsePaletteEntry(value) catch |err| switch (err) {
+            error.Overflow => return error.Overflow,
+            error.InvalidFormat => return error.InvalidValue,
+        };
+        self.value[entry.index] = entry.color;
+        self.mask.set(entry.index);
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -5889,52 +6213,21 @@ pub const RepeatableString = struct {
 pub const SelectionWordChars = struct {
     const Self = @This();
 
-    /// Default boundary characters: ` \t'"│`|:;,()[]{}<>$`
-    const default_codepoints = [_]u21{
-        0, // null
-        ' ', // space
-        '\t', // tab
-        '\'', // single quote
-        '"', // double quote
-        '│', // U+2502 box drawing
-        '`', // backtick
-        '|', // pipe
-        ':', // colon
-        ';', // semicolon
-        ',', // comma
-        '(', // left paren
-        ')', // right paren
-        '[', // left bracket
-        ']', // right bracket
-        '{', // left brace
-        '}', // right brace
-        '<', // less than
-        '>', // greater than
-        '$', // dollar
-    };
-
     /// The parsed codepoints. Always includes null (U+0000) at index 0.
-    codepoints: []const u21 = &default_codepoints,
+    codepoints: []const u21 = &terminal.selection_codepoints.default_word_boundaries,
 
     pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
         const value = input orelse return error.ValueRequired;
 
-        // Parse UTF-8 string into codepoints
+        // Parse string with Zig escape sequence support into codepoints
         var list: std.ArrayList(u21) = .empty;
         defer list.deinit(alloc);
 
         // Always include null as first boundary
         try list.append(alloc, 0);
 
-        // Parse the UTF-8 string
-        const utf8_view = std.unicode.Utf8View.init(value) catch {
-            // Invalid UTF-8, just use null boundary
-            self.codepoints = try list.toOwnedSlice(alloc);
-            return;
-        };
-
-        var utf8_it = utf8_view.iterator();
-        while (utf8_it.nextCodepoint()) |codepoint| {
+        var it = string.codepointIterator(value);
+        while (it.next() catch return error.InvalidValue) |codepoint| {
             try list.append(alloc, codepoint);
         }
 
@@ -5986,6 +6279,56 @@ pub const SelectionWordChars = struct {
         try testing.expectEqual(@as(u21, '\t'), chars.codepoints[2]);
         try testing.expectEqual(@as(u21, ';'), chars.codepoints[3]);
         try testing.expectEqual(@as(u21, ','), chars.codepoints[4]);
+    }
+
+    test "parseCLI escape sequences" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // \t escape should be parsed as tab
+        var chars: Self = .{};
+        try chars.parseCLI(alloc, " \\t;,");
+
+        try testing.expectEqual(@as(usize, 5), chars.codepoints.len);
+        try testing.expectEqual(@as(u21, 0), chars.codepoints[0]);
+        try testing.expectEqual(@as(u21, ' '), chars.codepoints[1]);
+        try testing.expectEqual(@as(u21, '\t'), chars.codepoints[2]);
+        try testing.expectEqual(@as(u21, ';'), chars.codepoints[3]);
+        try testing.expectEqual(@as(u21, ','), chars.codepoints[4]);
+    }
+
+    test "parseCLI backslash escape" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // \\ should be parsed as a single backslash
+        var chars: Self = .{};
+        try chars.parseCLI(alloc, "\\\\;");
+
+        try testing.expectEqual(@as(usize, 3), chars.codepoints.len);
+        try testing.expectEqual(@as(u21, 0), chars.codepoints[0]);
+        try testing.expectEqual(@as(u21, '\\'), chars.codepoints[1]);
+        try testing.expectEqual(@as(u21, ';'), chars.codepoints[2]);
+    }
+
+    test "parseCLI unicode escape" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // \u{2502} should be parsed as │
+        var chars: Self = .{};
+        try chars.parseCLI(alloc, "\\u{2502};");
+
+        try testing.expectEqual(@as(usize, 3), chars.codepoints.len);
+        try testing.expectEqual(@as(u21, 0), chars.codepoints[0]);
+        try testing.expectEqual(@as(u21, '│'), chars.codepoints[1]);
+        try testing.expectEqual(@as(u21, ';'), chars.codepoints[2]);
     }
 };
 
@@ -6115,6 +6458,22 @@ pub const RepeatableFontVariation = struct {
     }
 };
 
+/// Returns true if the given key event would trigger a keybinding
+/// if it were to be processed. This is useful for determining if
+/// a key event should be sent to the terminal or not.
+pub fn keyEventIsBinding(
+    self: *Config,
+    event: inputpkg.KeyEvent,
+) bool {
+    switch (event.action) {
+        .release => return false,
+        .press, .repeat => {},
+    }
+
+    // If we have a keybinding for this event then we return true.
+    return self.keybind.set.getEvent(event) != null;
+}
+
 /// Stores a set of keybinds.
 pub const Keybinds = struct {
     set: inputpkg.Binding.Set = .{},
@@ -6123,6 +6482,15 @@ pub const Keybinds = struct {
     /// which allows all table names to be available without reservation.
     tables: std.StringArrayHashMapUnmanaged(inputpkg.Binding.Set) = .empty,
 
+    /// The most recent binding target for `chain=` additions.
+    ///
+    /// This is intentionally tracked at the Keybinds level so that chains can
+    /// apply across table boundaries according to parse order.
+    chain_target: union(enum) {
+        root,
+        table: []const u8,
+    } = .root,
+
     pub fn init(self: *Keybinds, alloc: Allocator) !void {
         // We don't clear the memory because it's in the arena and unlikely
         // to be free-able anyways (since arenas can only clear the last
@@ -6130,6 +6498,7 @@ pub const Keybinds = struct {
         // will be freed when the config is freed.
         self.set = .{};
         self.tables = .empty;
+        self.chain_target = .root;
 
         // keybinds for opening and reloading config
         try self.set.put(
@@ -6187,10 +6556,11 @@ pub const Keybinds = struct {
                 .{ .copy_to_clipboard = .mixed },
                 .{ .performable = true },
             );
-            try self.set.put(
+            try self.set.putFlags(
                 alloc,
                 .{ .key = .{ .unicode = 'v' }, .mods = mods },
-                .{ .paste_from_clipboard = {} },
+                .paste_from_clipboard,
+                .{ .performable = true },
             );
         }
 
@@ -6454,13 +6824,27 @@ pub const Keybinds = struct {
             // Semantic prompts
             try self.set.put(
                 alloc,
-                .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .jump_to_prompt = -1 },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .jump_to_prompt = 1 },
+            );
+
+            // Move tab
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .move_tab = -1 },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .move_tab = 1 },
+                .{ .performable = true },
             );
 
             // Search
@@ -6912,6 +7296,7 @@ pub const Keybinds = struct {
             log.info("config has 'keybind = clear', all keybinds cleared", .{});
             self.set = .{};
             self.tables = .empty;
+            self.chain_target = .root;
             return;
         }
 
@@ -6949,16 +7334,39 @@ pub const Keybinds = struct {
             if (binding.len == 0) {
                 log.debug("config has 'keybind = {s}/', table cleared", .{table_name});
                 gop.value_ptr.* = .{};
+                self.chain_target = .root;
                 return;
+            }
+
+            // Chains are only allowed at the root level. Their target is
+            // tracked globally by parse order in `self.chain_target`.
+            if (std.mem.startsWith(u8, binding, "chain=")) {
+                return error.InvalidFormat;
             }
 
             // Parse and add the binding to the table
             try gop.value_ptr.parseAndPut(alloc, binding);
+            self.chain_target = .{ .table = gop.key_ptr.* };
+            return;
+        }
+
+        if (std.mem.startsWith(u8, value, "chain=")) {
+            switch (self.chain_target) {
+                .root => try self.set.parseAndPut(alloc, value),
+                .table => |table_name| {
+                    const table = self.tables.getPtr(table_name) orelse {
+                        self.chain_target = .root;
+                        return error.InvalidFormat;
+                    };
+                    try table.parseAndPut(alloc, value);
+                },
+            }
             return;
         }
 
         // Parse into default set
         try self.set.parseAndPut(alloc, value);
+        self.chain_target = .root;
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -7398,6 +7806,63 @@ pub const Keybinds = struct {
         try testing.expectEqual(0, keybinds.set.bindings.count());
         try testing.expectEqual(1, keybinds.tables.count());
         try testing.expect(keybinds.tables.contains("mytable"));
+    }
+
+    test "parseCLI chain without prior parsed binding is invalid" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var keybinds: Keybinds = .{};
+
+        try testing.expectError(
+            error.InvalidFormat,
+            keybinds.parseCLI(alloc, "chain=new_tab"),
+        );
+    }
+
+    test "parseCLI table chain syntax is invalid" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var keybinds: Keybinds = .{};
+
+        try keybinds.parseCLI(alloc, "foo/a=text:hello");
+        try testing.expectError(
+            error.InvalidFormat,
+            keybinds.parseCLI(alloc, "foo/chain=deactivate_key_table"),
+        );
+    }
+
+    test "parseCLI chain applies to most recent table binding" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var keybinds: Keybinds = .{};
+
+        try keybinds.parseCLI(alloc, "ctrl+n=activate_key_table:foo");
+        try keybinds.parseCLI(alloc, "foo/a=text:hello");
+        try keybinds.parseCLI(alloc, "chain=deactivate_key_table");
+
+        const root_entry = keybinds.set.get(.{
+            .mods = .{ .ctrl = true },
+            .key = .{ .unicode = 'n' },
+        }).?.value_ptr.*;
+        try testing.expect(root_entry == .leaf);
+        try testing.expect(root_entry.leaf.action == .activate_key_table);
+
+        const foo_entry = keybinds.tables.get("foo").?.get(.{
+            .key = .{ .unicode = 'a' },
+        }).?.value_ptr.*;
+        try testing.expect(foo_entry == .leaf_chained);
+        try testing.expectEqual(@as(usize, 2), foo_entry.leaf_chained.actions.items.len);
+        try testing.expect(foo_entry.leaf_chained.actions.items[0] == .text);
+        try testing.expect(foo_entry.leaf_chained.actions.items[1] == .deactivate_key_table);
     }
 
     test "clone with tables" {
@@ -8167,6 +8632,15 @@ pub const RepeatableLink = struct {
     const Self = @This();
 
     links: std.ArrayListUnmanaged(inputpkg.Link) = .{},
+    default_matchers_present: bool = false,
+
+    fn removeDefaultMatchers(self: *Self) void {
+        if (!self.default_matchers_present) return;
+
+        assert(self.links.items.len >= default_link_matcher_count);
+        self.links.items = self.links.items[default_link_matcher_count..];
+        self.default_matchers_present = false;
+    }
 
     pub fn parseCLI(self: *Self, alloc: Allocator, input_: ?[]const u8) !void {
         _ = self;
@@ -8192,11 +8666,16 @@ pub const RepeatableLink = struct {
             list.appendAssumeCapacity(copy);
         }
 
-        return .{ .links = list };
+        return .{
+            .links = list,
+            .default_matchers_present = self.default_matchers_present,
+        };
     }
 
     /// Compare if two of our value are requal. Required by Config.
     pub fn equal(self: Self, other: Self) bool {
+        if (self.default_matchers_present != other.default_matchers_present) return false;
+
         const itemsA = self.links.items;
         const itemsB = other.links.items;
         if (itemsA.len != itemsB.len) return false;
@@ -8244,6 +8723,15 @@ pub const RightClickAction = enum {
 
     /// Shows a context menu with options.
     @"context-menu",
+};
+
+/// Options for middle-click actions.
+pub const MiddleClickAction = enum {
+    /// Paste from the selection/standard clipboard per `copy-on-select`.
+    @"primary-paste",
+
+    /// No action is taken on middle click.
+    ignore,
 };
 
 /// Shell integration values
@@ -8309,6 +8797,13 @@ pub const RepeatableCommand = struct {
         // Unset or empty input clears the list
         const input = input_ orelse "";
         if (input.len == 0) {
+            log.info("config has 'command-palette-entry =', using default entries", .{});
+            try self.init(alloc);
+            return;
+        }
+
+        if (std.mem.eql(u8, input, "clear")) {
+            log.info("config has 'command-palette-entry = clear', all command entries cleared", .{});
             self.value.clearRetainingCapacity();
             self.value_c.clearRetainingCapacity();
             return;
@@ -8358,7 +8853,7 @@ pub const RepeatableCommand = struct {
         formatter: formatterpkg.EntryFormatter,
     ) !void {
         if (self.value.items.len == 0) {
-            try formatter.formatEntry(void, {});
+            try formatter.formatEntry([]const u8, "clear");
             return;
         }
 
@@ -8420,8 +8915,11 @@ pub const RepeatableCommand = struct {
         try testing.expectEqualStrings("Baz", list.value.items[3].title);
         try testing.expectEqualStrings("Raspberry Pie", list.value.items[3].description);
 
-        try list.parseCLI(alloc, "");
+        try list.parseCLI(alloc, "clear");
         try testing.expectEqual(@as(usize, 0), list.value.items.len);
+
+        try list.parseCLI(alloc, "");
+        try testing.expectEqual(inputpkg.command.defaults.len, list.value.items.len);
     }
 
     test "RepeatableCommand formatConfig empty" {
@@ -8431,7 +8929,7 @@ pub const RepeatableCommand = struct {
 
         var list: RepeatableCommand = .{};
         try list.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
-        try std.testing.expectEqualSlices(u8, "a = \n", buf.written());
+        try std.testing.expectEqualSlices(u8, "a = clear\n", buf.written());
     }
 
     test "RepeatableCommand formatConfig single item" {
@@ -8536,7 +9034,7 @@ pub const RepeatableCommand = struct {
         try list.parseCLI(alloc, "title:Foo,action:ignore");
         try testing.expectEqual(@as(usize, 1), list.cval().len);
 
-        try list.parseCLI(alloc, "");
+        try list.parseCLI(alloc, "clear");
         try testing.expectEqual(@as(usize, 0), list.cval().len);
     }
 };
@@ -9436,9 +9934,16 @@ pub const Theme = struct {
         // we're parsing a light/dark mode theme pair. Note that "=" isn't
         // actually valid for setting a light/dark mode pair but I anticipate
         // it'll be a common typo.
+        //
+        // On Windows, a colon at index 1 is a drive letter (e.g. C:\...)
+        // and should not trigger light/dark pair parsing.
+        const has_colon = if (comptime builtin.os.tag == .windows)
+            if (std.mem.indexOf(u8, input, ":")) |idx| idx != 1 else false
+        else
+            std.mem.indexOf(u8, input, ":") != null;
         if (std.mem.indexOf(u8, input, ",") != null or
             std.mem.indexOf(u8, input, "=") != null or
-            std.mem.indexOf(u8, input, ":") != null)
+            has_colon)
         {
             self.* = try cli.args.parseAutoStruct(
                 Theme,
@@ -10080,6 +10585,26 @@ test "clone preserves conditional set" {
     defer clone1.deinit();
 
     try testing.expect(clone1._conditional_set.contains(.theme));
+}
+
+test "working-directory expands tilde" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        "--working-directory=~/projects/ghostty",
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const expected = internal_os.expandHome(
+        "~/projects/ghostty",
+        &buf,
+    ) catch "~/projects/ghostty";
+    try testing.expectEqualStrings(expected, cfg.@"working-directory".?.value().?);
 }
 
 test "changed" {

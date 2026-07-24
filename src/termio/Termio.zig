@@ -5,6 +5,7 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -19,8 +20,15 @@ const apprt = @import("../apprt.zig");
 const internal_os = @import("../os/main.zig");
 const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
+const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
+
+pub const PtyTeeCallback = *const fn (
+    ?*anyopaque,
+    [*]const u8,
+    usize,
+) callconv(.c) void;
 
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
@@ -42,7 +50,7 @@ terminal: terminalpkg.Terminal,
 /// The shared render state
 renderer_state: *renderer.State,
 
-/// A handle to wake up the renderer. This hints to the renderer that that
+/// A handle to wake up the renderer. This hints to the renderer that
 /// a repaint should happen.
 renderer_wakeup: xev.Async,
 
@@ -58,9 +66,32 @@ size: renderer.Size,
 /// The mailbox implementation to use.
 mailbox: termio.Mailbox,
 
+/// cmux fork: manual IO currently needs an inline write path on iOS because
+/// the writer-thread async wakeup is not reliably firing in that environment.
+/// Delete when upstream supports manual backend writes without this path.
+manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
+
+/// cmux fork: optional tee callback that fires on every PTY-output byte
+/// before the VT parser sees it. Embedders (cmux's mac sync server) use
+/// this to broadcast raw bytes to a paired iPhone so the phone can feed
+/// the same bytes through its own libghostty surface, producing an
+/// identical grid by construction. Both fields are read on the IO read
+/// thread. The embedded runtime installs initial values before starting that
+/// thread; the compatibility setter may replace them after surface creation.
+pty_tee_cb: ?PtyTeeCallback = null,
+pty_tee_userdata: ?*anyopaque = null,
+
+/// Number of PTY-output bytes fully applied to terminal state. This is read
+/// and updated only while renderer_state.mutex is held. Addition wraps so the
+/// value remains a stable modulo-u64 stream position across long sessions.
+processed_output_bytes: u64 = 0,
+
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
+
+/// True when another terminal core owns protocol replies for this PTY.
+suppress_terminal_responses: bool,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -184,12 +215,7 @@ pub const DerivedConfig = struct {
                     break :generate;
                 }
 
-                break :palette terminalpkg.color.generate256Color(
-                    config.palette.value,
-                    config.palette.mask,
-                    config.background.toTerminalRGB(),
-                    config.foreground.toTerminalRGB(),
-                );
+                break :palette terminalpkg.color.generate256Color(config.palette.value, config.palette.mask, config.background.toTerminalRGB(), config.foreground.toTerminalRGB(), config.@"palette-harmonious");
             }
 
             break :palette config.palette.value;
@@ -259,20 +285,11 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
                 },
                 .palette = .init(opts.config.palette),
             },
+            .kitty_image_storage_limit = opts.config.image_storage_limit,
+            .kitty_image_loading_limits = .all,
         };
     });
     errdefer term.deinit(alloc);
-
-    // Set the image size limits
-    var it = term.screens.all.iterator();
-    while (it.next()) |entry| {
-        const screen: *terminalpkg.Screen = entry.value.*;
-        try screen.kitty_images.setLimit(
-            alloc,
-            screen,
-            opts.config.image_storage_limit,
-        );
-    }
 
     // Set our default cursor style
     term.screens.active.cursor.cursor_style = opts.config.cursor_style;
@@ -299,6 +316,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .enquiry_response = opts.config.enquiry_response,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
         .default_cursor_style = opts.config.cursor_style,
         .default_cursor_blink = opts.config.cursor_blink,
     };
@@ -319,7 +337,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .size = opts.size,
         .backend = backend,
         .mailbox = opts.mailbox,
+        .pty_tee_cb = opts.pty_tee_cb,
+        .pty_tee_userdata = opts.pty_tee_userdata,
         .terminal_stream = .initAlloc(alloc, handler),
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
         .thread_enter_state = thread_enter_state,
     };
 }
@@ -396,8 +417,8 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
-/// Send a message to the the mailbox. Depending on the mailbox type in
-/// use this may process now or it may just enqueue and process later.
+/// Send a message to the mailbox. Depending on the mailbox type in use
+/// this may process now or it may just enqueue and process later.
 ///
 /// This will also notify the mailbox thread to process the message. If
 /// you're sending a lot of messages, it may be more efficient to use
@@ -407,11 +428,94 @@ pub fn queueMessage(
     msg: termio.Message,
     mutex: MutexState,
 ) void {
+    switch (self.backend) {
+        .manual => {
+            self.queueMessageManual(msg);
+            return;
+        },
+        .exec => {},
+    }
+
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,
         .unlocked => null,
     });
     self.mailbox.notify();
+}
+
+fn queueMessageManual(self: *Termio, msg: termio.Message) void {
+    var td: ThreadData = .{
+        .alloc = self.alloc,
+        .loop = undefined,
+        .renderer_state = self.renderer_state,
+        .surface_mailbox = self.surface_mailbox,
+        .backend = .{ .manual = .{} },
+        .mailbox = &self.mailbox,
+    };
+
+    switch (msg) {
+        .color_scheme_report => |v| self.colorSchemeReport(&td, v.force) catch |err| {
+            log.warn("manual inline color_scheme_report failed err={}", .{err});
+        },
+        .crash => @panic("crash request, crashing intentionally"),
+        .change_config => |config| {
+            defer config.alloc.destroy(config.ptr);
+            self.changeConfig(&td, config.ptr) catch |err| {
+                log.warn("manual inline change_config failed err={}", .{err});
+            };
+        },
+        .inspector => {},
+        .resize => |v| self.resize(&td, v) catch |err| {
+            log.warn("manual inline resize failed err={}", .{err});
+        },
+        .size_report => |v| self.sizeReport(&td, v) catch |err| {
+            log.warn("manual inline size_report failed err={}", .{err});
+        },
+        .clear_screen => |v| self.clearScreen(&td, v.history) catch |err| {
+            log.warn("manual inline clear_screen failed err={}", .{err});
+        },
+        .scroll_viewport => |v| self.scrollViewport(v),
+        .selection_scroll => {},
+        .jump_to_prompt => |v| self.jumpToPrompt(v) catch |err| {
+            log.warn("manual inline jump_to_prompt failed err={}", .{err});
+        },
+        .start_synchronized_output => {},
+        .linefeed_mode => |v| self.manual_linefeed_mode.store(v, .monotonic),
+        .focused => |v| self.focusGained(&td, v) catch |err| {
+            log.warn("manual inline focused failed err={}", .{err});
+        },
+        .write_small => |v| self.queueWriteManual(
+            &td,
+            v.data[0..v.len],
+        ) catch |err| {
+            log.warn("manual inline write_small failed err={}", .{err});
+        },
+        .write_stable => |v| self.queueWriteManual(&td, v) catch |err| {
+            log.warn("manual inline write_stable failed err={}", .{err});
+        },
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            self.queueWriteManual(&td, v.data) catch |err| {
+                log.warn("manual inline write_alloc failed err={}", .{err});
+            };
+        },
+    }
+
+    self.renderer_wakeup.notify() catch |err| {
+        log.warn("manual inline renderer wakeup failed err={}", .{err});
+    };
+}
+
+fn queueWriteManual(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+) !void {
+    const linefeed = self.manual_linefeed_mode.load(.monotonic);
+    switch (self.backend) {
+        .manual => |*manual| try manual.queueWrite(self.alloc, td, data, linefeed),
+        .exec => unreachable,
+    }
 }
 
 /// Queue a write directly to the pty.
@@ -467,16 +571,28 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         break :cursor color.toTerminalRGB() orelse break :cursor null;
     };
 
-    // Set the image size limits
-    var it = self.terminal.screens.all.iterator();
-    while (it.next()) |entry| {
-        const screen: *terminalpkg.Screen = entry.value.*;
-        try screen.kitty_images.setLimit(
-            self.alloc,
-            screen,
-            config.image_storage_limit,
-        );
-    }
+    // Set the image limits
+    try self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
+    self.terminal.setKittyGraphicsLoadingLimits(.all);
+}
+
+/// Update only the terminal color defaults used by OSC resets.
+///
+/// Manual-IO embedders call this on the same serial executor as processOutput.
+/// Unlike a full surface config reload, this does not touch the font grid or
+/// enqueue a blocking renderer-mailbox config message.
+pub fn changeColorConfig(self: *Termio, config: *const DerivedConfig) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    self.terminal.colors.palette.changeDefault(config.palette);
+    self.terminal.colors.background.default = config.background.toTerminalRGB();
+    self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
+    self.terminal.colors.cursor.default = cursor: {
+        const color = config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
+    self.terminal.flags.dirty.palette = true;
 }
 
 /// Resize the terminal.
@@ -517,8 +633,33 @@ pub fn resize(
         }
     }
 
-    // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    // Mail the renderer so that it can update the GPU and re-render.
+    //
+    // cmux iOS fork: on iOS there is no draining renderer-thread vsync loop;
+    // `render_now` is the renderer mailbox's only drainer and runs on the SAME
+    // serial dispatch queue that runs this resize (iOS uses the `.manual` termio
+    // backend, so `Termio.resize` executes inline on that queue). A `.forever`
+    // push here therefore wedges the queue permanently whenever the mailbox is
+    // full: the `render_now` queued behind it can never run to drain it.
+    // Invariant: nothing reachable from the iOS render serial queue may block
+    // unboundedly on a resource that only `render_now` drains.
+    //
+    // Dropping the `.resize` message on a full mailbox is lossless on iOS: the
+    // grid size was already applied inline above (and is re-asserted by
+    // `applyPendingResizeIfNeeded` before each `render_now`), `drawFrame`
+    // re-derives the screen pixel size from the CAMetalLayer every frame, and
+    // the only renderer state this message carries (`setScreenSize` applies just
+    // `size.padding`) is INVARIANT across resizes on iOS (padding balance is off,
+    // so padding does not depend on surface size): a dropped resize keeps the
+    // renderer's padding == the new padding. So an instant push that drops on
+    // full re-derives identically on the next draw.
+    // macOS keeps the proven wake+forever path (its renderer thread is a real
+    // draining loop).
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    }
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -530,49 +671,26 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    if (self.suppress_terminal_responses) return;
     const grid_size = self.size.grid();
+    const report_size: terminalpkg.size_report.Size = .{
+        .rows = grid_size.rows,
+        .columns = grid_size.columns,
+        .cell_width = self.size.cell.width,
+        .cell_height = self.size.cell.height,
+    };
 
     // 1024 bytes should be enough for size report since report
     // in columns and pixels.
     var buf: [1024]u8 = undefined;
-    const message = switch (style) {
-        .mode_2048 => try std.fmt.bufPrint(
-            &buf,
-            "\x1B[48;{};{};{};{}t",
-            .{
-                grid_size.rows,
-                grid_size.columns,
-                grid_size.rows * self.size.cell.height,
-                grid_size.columns * self.size.cell.width,
-            },
-        ),
-        .csi_14_t => try std.fmt.bufPrint(
-            &buf,
-            "\x1b[4;{};{}t",
-            .{
-                grid_size.rows * self.size.cell.height,
-                grid_size.columns * self.size.cell.width,
-            },
-        ),
-        .csi_16_t => try std.fmt.bufPrint(
-            &buf,
-            "\x1b[6;{};{}t",
-            .{
-                self.size.cell.height,
-                self.size.cell.width,
-            },
-        ),
-        .csi_18_t => try std.fmt.bufPrint(
-            &buf,
-            "\x1b[8;{};{}t",
-            .{
-                grid_size.rows,
-                grid_size.columns,
-            },
-        ),
-    };
+    var writer: std.Io.Writer = .fixed(&buf);
+    try terminalpkg.size_report.encode(
+        &writer,
+        style,
+        report_size,
+    );
 
-    try self.queueWrite(td, message, false);
+    try self.queueWrite(td, writer.buffered(), false);
 }
 
 /// Reset the synchronized output mode. This is usually called by timer
@@ -605,16 +723,15 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // If we're not at a prompt, we just delete above the cursor.
         if (!self.terminal.cursorIsAtPrompt()) {
             if (self.terminal.screens.active.cursor.y > 0) {
-                self.terminal.screens.active.eraseRows(
-                    .{ .active = .{ .y = 0 } },
-                    .{ .active = .{ .y = self.terminal.screens.active.cursor.y - 1 } },
+                self.terminal.screens.active.eraseActive(
+                    self.terminal.screens.active.cursor.y - 1,
                 );
             }
 
             // Clear all Kitty graphics state for this screen. This copies
             // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
             // didn't spend time researching whether it only deletes Kitty
-            // graphics that are placed baove the cursor or if it deletes
+            // graphics that are placed above the cursor or if it deletes
             // all of them. We delete all of them for now but if this behavior
             // isn't fully correct we should fix this later.
             self.terminal.screens.active.kitty_images.delete(
@@ -641,10 +758,13 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
 }
 
 /// Scroll the viewport
-pub fn scrollViewport(self: *Termio, scroll: terminalpkg.Terminal.ScrollViewport) !void {
+pub fn scrollViewport(
+    self: *Termio,
+    scroll: terminalpkg.Terminal.ScrollViewport,
+) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    try self.terminal.scrollViewport(scroll);
+    self.terminal.scrollViewport(scroll);
 }
 
 /// Jump the viewport to the prompt.
@@ -665,9 +785,14 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.unlock();
 
     // If we have focus events enabled, we send the focus event.
-    if (focus_event) {
-        const seq = if (focused) "\x1b[I" else "\x1b[O";
-        try self.queueWrite(td, seq, false);
+    if (focus_event and !self.suppress_terminal_responses) {
+        var buf: [terminalpkg.focus.max_encode_size]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        terminalpkg.focus.encode(&writer, if (focused) .gained else .lost) catch |err| {
+            log.err("error encoding focus event err={}", .{err});
+            return;
+        };
+        try self.queueWrite(td, writer.buffered(), false);
     }
 
     // We always notify our backend of focus changes.
@@ -678,11 +803,27 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    // cmux fork: tee raw PTY bytes BEFORE locking the renderer mutex or
+    // touching terminal state. The tee callback is expected to be cheap
+    // (typically a memcpy into a ring buffer + a wakeup). It runs on the
+    // read thread; the embedder owns thread safety for any cross-thread
+    // hand-off. Tee fires for every byte the read thread produces,
+    // regardless of mode.
+    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    self.processOutputLocked(buf);
+    processOutputAndAdvanceLocked(self, buf);
+}
+
+/// Apply output and publish its byte position as one renderer-mutex critical
+/// section. Keeping the sequence update after the parser is the recovery
+/// contract: observers never see bytes as processed before terminal state does.
+fn processOutputAndAdvanceLocked(context: anytype, buf: []const u8) void {
+    context.processOutputLocked(buf);
+    context.processed_output_bytes +%= @intCast(buf.len);
 }
 
 /// Process output from readdata but the lock is already held.
@@ -723,12 +864,10 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
                 log.err("error recording pty read in inspector err={}", .{err});
             };
 
-            self.terminal_stream.next(byte) catch |err|
-                log.err("error processing terminal data: {}", .{err});
+            self.terminal_stream.next(byte);
         }
     } else {
-        self.terminal_stream.nextSlice(buf) catch |err|
-            log.err("error processing terminal data: {}", .{err});
+        self.terminal_stream.nextSlice(buf);
     }
 
     // If our stream handling caused messages to be sent to the mailbox
@@ -737,6 +876,31 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+}
+
+test "processed output sequence advances after output is applied" {
+    const FakeTermio = struct {
+        processed_output_bytes: u64,
+        sequence_during_apply: u64 = 0,
+        applied_bytes: usize = 0,
+
+        fn processOutputLocked(self: *@This(), buf: []const u8) void {
+            self.sequence_during_apply = self.processed_output_bytes;
+            self.applied_bytes = buf.len;
+        }
+    };
+
+    var fake: FakeTermio = .{
+        .processed_output_bytes = std.math.maxInt(u64) - 1,
+    };
+    processOutputAndAdvanceLocked(&fake, "abc");
+
+    try std.testing.expectEqual(
+        std.math.maxInt(u64) - 1,
+        fake.sequence_during_apply,
+    );
+    try std.testing.expectEqual(@as(usize, 3), fake.applied_bytes);
+    try std.testing.expectEqual(@as(u64, 1), fake.processed_output_bytes);
 }
 
 /// Sends a DSR response for the current color scheme to the pty.
@@ -748,14 +912,19 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.suppress_terminal_responses) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const output = switch (self.config.conditional_state.theme) {
-        .light => "\x1B[?997;2n",
-        .dark => "\x1B[?997;1n",
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+        .light => .light,
+        .dark => .dark,
     };
-    try self.queueWrite(td, output, false);
+
+    var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
+    try self.queueWrite(td, writer.buffered(), false);
 }
 
 /// ThreadData is the data created and stored in the termio thread
@@ -787,3 +956,10 @@ pub const ThreadData = struct {
         self.* = undefined;
     }
 };
+
+/// Get information about the process(es) attached to the backend. Returns
+/// `null` if there was an error getting the information or the information is
+/// not available on a particular platform.
+pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+    return self.backend.getProcessInfo(info);
+}

@@ -29,17 +29,20 @@ pub fn detect(b: *std.Build) !Version {
             error.ExitCodeFailure => return error.GitNotRepository,
             else => return err,
         };
-        // Replace any '/' with '-' as including slashes will mess up building
-        // the dist tarball - the tarball uses the branch as part of the
-        // name and including slashes means that the tarball will end up in
-        // subdirectories instead of where it's supposed to be.
-        std.mem.replaceScalar(u8, tmp, '/', '-');
+
+        // Replace characters that are not valid in semantic version
+        // pre-release identifiers (which only allow [0-9A-Za-z-]).
+        // Slashes would also mess up dist tarball paths.
+        for (tmp) |*c| {
+            if (!std.ascii.isAlphanumeric(c.*) and c.* != '-') c.* = '-';
+        }
+
         break :b tmp;
     };
 
     const short_hash = short_hash: {
         const output = b.runAllowFail(
-            &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "log", "--pretty=format:%h", "-n", "1" },
+            &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "-c", "log.showSignature=false", "log", "--pretty=format:%h", "-n", "1" },
             &code,
             .Ignore,
         ) catch |err| switch (err) {

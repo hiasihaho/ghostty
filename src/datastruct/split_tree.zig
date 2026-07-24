@@ -265,7 +265,7 @@ pub fn SplitTree(comptime V: type) type {
                     // Get our spatial representation.
                     var sp = try self.spatial(alloc);
                     defer sp.deinit(alloc);
-                    break :spatial self.nearest(sp, from, d);
+                    break :spatial self.nearestWrapped(sp, from, d);
                 },
             };
         }
@@ -385,14 +385,15 @@ pub fn SplitTree(comptime V: type) type {
         }
 
         /// Returns the nearest leaf node (view) in the given direction.
+        /// This does not handle wrapping and will return null if there
+        /// is no node in that direction.
         fn nearest(
             self: *const Self,
             sp: Spatial,
             from: Node.Handle,
             direction: Spatial.Direction,
+            target: Spatial.Slot,
         ) ?Node.Handle {
-            const target = sp.slots[from.idx()];
-
             var result: ?struct {
                 handle: Node.Handle,
                 distance: f16,
@@ -431,6 +432,45 @@ pub fn SplitTree(comptime V: type) type {
             }
 
             return if (result) |n| n.handle else null;
+        }
+
+        /// Same as nearest but supports wrapping.
+        fn nearestWrapped(
+            self: *const Self,
+            sp: Spatial,
+            from: Node.Handle,
+            direction: Spatial.Direction,
+        ) ?Node.Handle {
+            // If we can find a nearest value without wrapping, then
+            // use that.
+            var target = sp.slots[from.idx()];
+            if (self.nearest(
+                sp,
+                from,
+                direction,
+                target,
+            )) |v| return v;
+
+            // The spatial grid is normalized to 1x1, so wrapping is modeled
+            // by shifting the target slot by one full grid in the opposite
+            // direction and reusing the same nearest distance logic.
+            // We don't actually modify the grid or spatial representation,
+            // this just fakes it.
+            assert(target.x >= 0 and target.y >= 0);
+            assert(target.maxX() <= 1 and target.maxY() <= 1);
+            switch (direction) {
+                .left => target.x += 1,
+                .right => target.x -= 1,
+                .up => target.y += 1,
+                .down => target.y -= 1,
+            }
+
+            return self.nearest(
+                sp,
+                from,
+                direction,
+                target,
+            );
         }
 
         /// Resize the given node in place. The node MUST be a split (asserted).
@@ -820,25 +860,26 @@ pub fn SplitTree(comptime V: type) type {
             var sp = try result.spatial(gpa);
             defer sp.deinit(gpa);
 
-            // Get the ratio of the split relative to the full grid.
-            const full_ratio = full_ratio: {
-                // Our scale is the amount we need to multiply our individual
-                // ratio by to get the full ratio. Its actually a ratio on its
-                // own but I'm trying to avoid that word: its the ratio of
-                // our spatial width/height to the total.
-                const scale = switch (layout) {
-                    .horizontal => sp.slots[parent_handle.idx()].width / sp.slots[0].width,
-                    .vertical => sp.slots[parent_handle.idx()].height / sp.slots[0].height,
-                };
-
-                const current = result.nodes[parent_handle.idx()].split.ratio;
-                break :full_ratio current * scale;
+            // Our scale is the amount we need to divide our ratio delta by to
+            // get a delta relative to the split, not the entire grid.
+            // Its actually a ratio on its own but I'm trying to avoid that word:
+            // its the ratio of our spatial width/height to the total.
+            const scale = switch (layout) {
+                .horizontal => sp.slots[parent_handle.idx()].width / sp.slots[0].width,
+                .vertical => sp.slots[parent_handle.idx()].height / sp.slots[0].height,
             };
 
-            // Set the final new ratio, clamping it to [0, 1]
+            // If the split has spatial width/height 0, resizing by a percentage
+            // of the total grid size doesn't make sense.
+            if (scale == 0) return result;
+
+            // Adjust the old split ratio by the scaled ratio delta.
+            const new_ratio = result.nodes[parent_handle.idx()].split.ratio + (ratio / scale);
+
+            // Set the new ratio, clamping it to [0, 1]
             result.resizeInPlace(
                 parent_handle,
-                @min(@max(full_ratio + ratio, 0), 1),
+                @min(@max(new_ratio, 0), 1),
             );
             return result;
         }
@@ -1974,6 +2015,60 @@ test "SplitTree: spatial goto" {
         try testing.expectEqualStrings("A", view.label);
     }
 
+    // Spatial A => left (wrapped)
+    {
+        const target = (try split.goto(
+            alloc,
+            from: {
+                var it = split.iterator();
+                break :from while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "A")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .{ .spatial = .left },
+        )).?;
+        const view = split.nodes[target.idx()].leaf;
+        try testing.expectEqualStrings("B", view.label);
+    }
+
+    // Spatial B => right (wrapped)
+    {
+        const target = (try split.goto(
+            alloc,
+            from: {
+                var it = split.iterator();
+                break :from while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "B")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .{ .spatial = .right },
+        )).?;
+        const view = split.nodes[target.idx()].leaf;
+        try testing.expectEqualStrings("A", view.label);
+    }
+
+    // Spatial C => down (wrapped)
+    {
+        const target = (try split.goto(
+            alloc,
+            from: {
+                var it = split.iterator();
+                break :from while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "C")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .{ .spatial = .down },
+        )).?;
+        const view = split.nodes[target.idx()].leaf;
+        try testing.expectEqualStrings("A", view.label);
+    }
+
     // Equalize
     var equal = try split.equalize(alloc);
     defer equal.deinit();
@@ -2073,6 +2168,155 @@ test "SplitTree: resize" {
             \\+---++-------------+
             \\| A ||      B      |
             \\+---++-------------+
+            \\
+        );
+    }
+}
+
+test "SplitTree: resize nested split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    // A | B vertical
+    var splitAB = try t1.split(
+        alloc,
+        .root, // at root
+        .down, // split down
+        0.5,
+        &t2, // insert t2
+    );
+    defer splitAB.deinit();
+
+    var splitBC = try splitAB.split(
+        alloc,
+        at: {
+            var it = splitAB.iterator();
+            break :at while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, "B")) {
+                    break entry.handle;
+                }
+            } else return error.NotFound;
+        },
+        .down, // split down
+        0.5,
+        &t3, // insert t3
+    );
+    defer splitBC.deinit();
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(splitBC, .formatDiagram)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---+
+            \\|   |
+            \\|   |
+            \\| A |
+            \\|   |
+            \\+---+
+            \\+---+
+            \\| B |
+            \\+---+
+            \\+---+
+            \\| C |
+            \\+---+
+            \\
+        );
+    }
+
+    // Resize
+    {
+        var resized = try splitBC.resize(
+            alloc,
+            at: {
+                var it = splitBC.iterator();
+                break :at while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "B")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .vertical, // resize down
+            0.125,
+        );
+        defer resized.deinit();
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(resized, .formatDiagram)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---+
+            \\|   |
+            \\|   |
+            \\|   |
+            \\|   |
+            \\|   |
+            \\| A |
+            \\|   |
+            \\|   |
+            \\|   |
+            \\|   |
+            \\+---+
+            \\+---+
+            \\|   |
+            \\|   |
+            \\|   |
+            \\| B |
+            \\|   |
+            \\|   |
+            \\|   |
+            \\+---+
+            \\+---+
+            \\| C |
+            \\+---+
+            \\
+        );
+    }
+
+    // Resize the other direction (negative ratio)
+    {
+        var resized = try splitBC.resize(
+            alloc,
+            at: {
+                var it = splitBC.iterator();
+                break :at while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "B")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .vertical, // resize up
+            -0.0833,
+        );
+        defer resized.deinit();
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(resized, .formatDiagram)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---+
+            \\|   |
+            \\|   |
+            \\|   |
+            \\| A |
+            \\|   |
+            \\|   |
+            \\|   |
+            \\+---+
+            \\+---+
+            \\| B |
+            \\+---+
+            \\+---+
+            \\|   |
+            \\|   |
+            \\| C |
+            \\|   |
+            \\+---+
             \\
         );
     }
