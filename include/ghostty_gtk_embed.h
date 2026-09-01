@@ -17,6 +17,7 @@
 #define GHOSTTY_GTK_EMBED_H
 
 #include <stdbool.h>
+#include <stdint.h>   // int64_t: surface pid accessor
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -101,6 +102,12 @@ bool ghostty_embed_surface_write_display(void* widget,
 // whole buffer including scrollback history. Returns a NUL-terminated
 // string to release with ghostty_embed_text_free, or NULL while the
 // surface's shell isn't running yet.
+// PID of the surface's child process, or -1 when unknowable: no core
+// surface yet, child not spawned or already exited, or the Flatpak
+// host-command path (child lives in another namespace). -1 is deliberate:
+// callers must not attribute processes they cannot see.
+int64_t ghostty_embed_surface_pid(void* widget);
+
 char* ghostty_embed_surface_read_text(void* widget, bool include_scrollback);
 void ghostty_embed_text_free(char* text);
 

@@ -294,6 +294,32 @@ export fn ghostty_embed_surface_write_display(
 /// `include_scrollback`, the whole screen buffer including history.
 /// Returns a NUL-terminated string owned by the shim — free it with
 /// ghostty_embed_text_free — or NULL if the core surface isn't ready.
+/// PID of the surface's child process, or -1 when there is none.
+///
+/// cmux needs this for two things the terminal alone cannot answer:
+/// attributing OS processes to panes (`system.top`), and correcting a
+/// stale/leaked CMUX_SURFACE_ID by asking "which surface owns this pid".
+/// VTE hands its host the spawn pid directly; the embedded path had no
+/// equivalent, so those features were Linux-blind for ghostty panes.
+///
+/// Returns -1 (never 0, never a partial answer) when: the surface has no
+/// core yet, the child has not spawned or has exited, or the child runs
+/// through the Flatpak host-command path, where it lives in another
+/// namespace and has no pid meaningful to this process. An honest -1 is
+/// the point: the caller must not attribute processes it cannot see.
+export fn ghostty_embed_surface_pid(widget: *gtk.Widget) i64 {
+    const core_surface = coreSurfaceFromWidget(widget) orelse return -1;
+    return switch (core_surface.io.backend) {
+        .exec => |*exec| pid: {
+            const proc = exec.subprocess.process orelse break :pid -1;
+            break :pid switch (proc) {
+                .fork_exec => |cmd| if (cmd.pid) |value| @intCast(value) else -1,
+                .flatpak => -1,
+            };
+        },
+    };
+}
+
 export fn ghostty_embed_surface_read_text(
     widget: *gtk.Widget,
     include_scrollback: bool,
