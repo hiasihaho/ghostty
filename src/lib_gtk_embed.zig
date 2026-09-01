@@ -309,15 +309,37 @@ export fn ghostty_embed_surface_write_display(
 /// the point: the caller must not attribute processes it cannot see.
 export fn ghostty_embed_surface_pid(widget: *gtk.Widget) i64 {
     const core_surface = coreSurfaceFromWidget(widget) orelse return -1;
-    return switch (core_surface.io.backend) {
-        .exec => |*exec| pid: {
-            const proc = exec.subprocess.process orelse break :pid -1;
-            break :pid switch (proc) {
-                .fork_exec => |cmd| if (cmd.pid) |value| @intCast(value) else -1,
-                .flatpak => -1,
+    switch (core_surface.io.backend) {
+        .exec => |*exec| {
+            // Pointer capture, not a copy: the flatpak variant carries a
+            // mutex and condvar, and copying those to read a field is how
+            // you get a lock that guards nothing.
+            if (exec.subprocess.process) |*proc| switch (proc.*) {
+                .fork_exec => |cmd| return if (cmd.pid) |value| @intCast(value) else -1,
+
+                // Flatpak host-spawn: the child runs on the HOST, and the
+                // portal hands back its host pid ("Process started with the
+                // given pid on the host"). It is a real, usable identity —
+                // just in another PID namespace, so a caller resolving it
+                // against the sandbox's /proc would read an unrelated
+                // process. cmux labels it `pid_namespace: host` and reads
+                // host /proc through the portal rather than locally.
+                //
+                // Only `.started` yields a pid: after `.exited` the number
+                // is free for reuse, and a recycled pid is exactly the
+                // wrong-attribution failure this accessor exists to avoid.
+                .flatpak => |*host| {
+                    host.state_mutex.lock();
+                    defer host.state_mutex.unlock();
+                    return switch (host.state) {
+                        .started => |v| @intCast(v.pid),
+                        else => -1,
+                    };
+                },
             };
+            return -1;
         },
-    };
+    }
 }
 
 export fn ghostty_embed_surface_read_text(
