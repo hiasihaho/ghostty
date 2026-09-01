@@ -6,6 +6,7 @@ const EnvMap = std.process.EnvMap;
 const config = @import("../config.zig");
 const homedir = @import("../os/homedir.zig");
 const internal_os = @import("../os/main.zig");
+const build_config = @import("../build_config.zig");
 
 const log = std.log.scoped(.shell_integration);
 
@@ -373,7 +374,20 @@ fn setupBash(
         "{s}/shell-integration/bash/ghostty.bash",
         .{resource_dir},
     );
-    if (std.fs.openFileAbsolute(script_path, .{})) |file| {
+    // Under Flatpak the integration script is verified by the WRONG process.
+    // `resource_dir` is the host-visible path (the shell that will source it
+    // runs on the host through the portal), but this open() happens inside
+    // the sandbox, where flatpak masks ~/.local/share/flatpak — so the check
+    // fails for a file the host can read perfectly well, integration is
+    // silently disabled, and ENV is removed. Symptom seen 2026-09-01: pane
+    // titles tracked the directory (OSC 0) while OSC 7 never fired, so every
+    // restored workspace came back at $HOME.
+    //
+    // The host is the only process that can answer this question, so under
+    // Flatpak we trust the path rather than testing it from the wrong side.
+    if (comptime build_config.flatpak) {
+        try env.put("ENV", script_path);
+    } else if (std.fs.openFileAbsolute(script_path, .{})) |file| {
         file.close();
         try env.put("ENV", script_path);
     } else |err| {
